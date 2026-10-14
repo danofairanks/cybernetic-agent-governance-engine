@@ -96,21 +96,23 @@ def _valid_spend(value: Any) -> bool:
 
 
 def _seed_cumulative_spend_keys(state: dict[str, Any]) -> None:
-    """Seed both cumulative-spend keys from the larger valid value present, else 0.0.
+    """Synchronise both cumulative-spend keys to the larger valid value present, else 0.0.
 
     ``FiscalTierPlugin`` prefers ``_shadow_daily_spend_usd`` whenever that key is
-    present, so seeding it to ``0.0`` while a caller carries spend only in
-    ``cumulative_notional`` would mask that spend. Seeding both keys from the
-    same value keeps them in lockstep with :func:`default_shadow_state_reducer`.
+    present, so a smaller (or seeded ``0.0``) value in one key would mask spend
+    carried in the other. Valid values are raised to their maximum and a missing key is
+    filled from it; an invalid value (NaN, negative, bool) is left untouched, because
+    the tier ignores it and consults the live guard instead.
     """
-    present = [
-        float(state[k])
+    valid = {
+        k: float(state[k])
         for k in _CUMULATIVE_SPEND_SHADOW_KEYS
         if k in state and _valid_spend(state[k])
-    ]
-    base = max(present) if present else 0.0
+    }
+    base = max(valid.values()) if valid else 0.0
     for k in _CUMULATIVE_SPEND_SHADOW_KEYS:
-        state.setdefault(k, base)
+        if k not in state or k in valid:
+            state[k] = base
 
 
 def _reconcile_step_spend_keys(

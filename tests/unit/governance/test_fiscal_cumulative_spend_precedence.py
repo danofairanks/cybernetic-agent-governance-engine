@@ -28,6 +28,7 @@ import pytest
 
 from src.cage_finance.tiers.fiscal_tier import FiscalTierPlugin
 from src.eval_harness import FoundationModelEvalHarness, ToolActionStep
+from src.eval_harness.harness import _seed_cumulative_spend_keys
 from tests.fixtures.governor import default_classifier, make_governor
 
 pytestmark = [pytest.mark.unit, pytest.mark.local]
@@ -126,3 +127,51 @@ async def test_initial_cumulative_notional_accumulates_across_steps() -> None:
     )
     assert report.allow_steps == 1
     assert report.step_results[1].decision.value == "DENY"
+
+
+@pytest.mark.asyncio
+async def test_initial_state_with_unequal_keys_uses_the_larger_spend() -> None:
+    """Case F: both keys present in ``initial_shadow_state`` but out of sync.
+
+    ``FiscalTierPlugin`` prefers ``_shadow_daily_spend_usd``, so the smaller value
+    must be raised to the larger one rather than left to mask it.
+    """
+    report, _ = await _harness().evaluate_trajectory(
+        trajectory_id="fiscal-F",
+        model_id="test",
+        prompt="trade",
+        steps=[_step(1)],
+        initial_shadow_state={
+            "_shadow_daily_spend_usd": 0.0,
+            "cumulative_notional": 1e9,
+        },
+    )
+    assert report.allow_steps == 0
+
+
+def test_seed_synchronises_valid_values_and_preserves_invalid_ones() -> None:
+    nan = float("nan")
+
+    state: dict[str, object] = {}
+    _seed_cumulative_spend_keys(state)
+    assert state == {"_shadow_daily_spend_usd": 0.0, "cumulative_notional": 0.0}
+
+    state = {"cumulative_notional": 7.0}
+    _seed_cumulative_spend_keys(state)
+    assert state == {"_shadow_daily_spend_usd": 7.0, "cumulative_notional": 7.0}
+
+    state = {"_shadow_daily_spend_usd": 1.0, "cumulative_notional": 9.0}
+    _seed_cumulative_spend_keys(state)
+    assert state == {"_shadow_daily_spend_usd": 9.0, "cumulative_notional": 9.0}
+
+    # An invalid value is never overwritten (the tier ignores it and consults the live
+    # guard); a missing key is filled from the valid one.
+    state = {"_shadow_daily_spend_usd": nan}
+    _seed_cumulative_spend_keys(state)
+    assert state["_shadow_daily_spend_usd"] is nan
+    assert state["cumulative_notional"] == 0.0
+
+    state = {"_shadow_daily_spend_usd": True, "cumulative_notional": 5.0}
+    _seed_cumulative_spend_keys(state)
+    assert state["_shadow_daily_spend_usd"] is True
+    assert state["cumulative_notional"] == 5.0
