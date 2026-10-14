@@ -86,6 +86,45 @@ _CUMULATIVE_SPEND_SHADOW_KEYS = (
 )
 
 
+def _valid_spend(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) >= 0.0
+    )
+
+
+def _seed_cumulative_spend_keys(state: dict[str, Any]) -> None:
+    """Seed both cumulative-spend keys from the larger valid value present, else 0.0.
+
+    ``FiscalTierPlugin`` prefers ``_shadow_daily_spend_usd`` whenever that key is
+    present, so seeding it to ``0.0`` while a caller carries spend only in
+    ``cumulative_notional`` would mask that spend. Seeding both keys from the
+    same value keeps them in lockstep with :func:`default_shadow_state_reducer`.
+    """
+    present = [
+        float(state[k])
+        for k in _CUMULATIVE_SPEND_SHADOW_KEYS
+        if k in state and _valid_spend(state[k])
+    ]
+    base = max(present) if present else 0.0
+    for k in _CUMULATIVE_SPEND_SHADOW_KEYS:
+        state.setdefault(k, base)
+
+
+def _reconcile_step_spend_keys(
+    effective_context: dict[str, Any], step_context: Mapping[str, Any]
+) -> None:
+    """When a step supplies exactly one cumulative-spend key, it overrides the seeded other."""
+    supplied = [k for k in _CUMULATIVE_SPEND_SHADOW_KEYS if k in step_context]
+    if len(supplied) != 1 or not _valid_spend(step_context[supplied[0]]):
+        return
+    for k in _CUMULATIVE_SPEND_SHADOW_KEYS:
+        if k != supplied[0]:
+            effective_context[k] = step_context[supplied[0]]
+
+
 def default_shadow_state_reducer(
     state: dict[str, Any],
     step: ToolActionStep,
@@ -1343,11 +1382,12 @@ class FoundationModelEvalHarness:
             state_reducer or default_shadow_state_reducer
         )
         if effective_reducer is default_shadow_state_reducer:
-            for k in _CUMULATIVE_SPEND_SHADOW_KEYS:
-                shadow_state.setdefault(k, 0.0)
+            _seed_cumulative_spend_keys(shadow_state)
 
         for step in steps:
             effective_context = {**shadow_state, **step.context}
+            if effective_reducer is default_shadow_state_reducer:
+                _reconcile_step_spend_keys(effective_context, step.context)
             decision, narrowed_args, reasons = await self._evaluate_single(
                 step.tool_name, step.arguments, effective_context
             )
