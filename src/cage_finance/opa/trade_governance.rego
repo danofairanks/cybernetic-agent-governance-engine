@@ -32,6 +32,54 @@ default allow = "DENY"
 allowed_roles := {"junior", "senior"}
 
 # ---------------------------------------------------------------------------
+# Trade actions and assets (GHSA-f6xq-23f7-9grm)
+#
+# Every action that places an order is a trade action, held to the same RBAC
+# limits, quota rules and asset restrictions below. Previously only
+# execute_trade was, so execute_trade_bounded fell through to the risk-profile
+# rules and was allowed for any role, amount or asset.
+#
+# A trade's currency must be a string naming a tradable currency
+# (tradable_currencies; the reference broker settles in USD only). That is an
+# allowlist, so an alternate code for a restricted asset ("XBT") or a
+# look-alike spelling is never admitted as a currency. Restricted assets are
+# also refused as the instrument symbol. Both values are compared normalised
+# (whitespace trimmed, upper-cased): an exact comparison let "btc", "Btc" and
+# "BTC " through the BTC restriction. Without a tradable currency, no ALLOW or
+# MANUAL_REVIEW rule fires (fail closed).
+# ---------------------------------------------------------------------------
+trade_actions := {"execute_trade", "execute_trade_bounded"}
+
+tradable_currencies := {"USD"}
+
+restricted_assets := {"BTC", "XBT"}
+
+_is_trade if input.action in trade_actions
+
+_currency := upper(trim_space(input.currency)) if is_string(input.currency)
+
+_symbol := upper(trim_space(input.symbol)) if is_string(input.symbol)
+
+_restricted_asset if _currency in restricted_assets
+
+_restricted_asset if _symbol in restricted_assets
+
+# The order is in a tradable currency and touches no restricted asset.
+_admissible_asset if {
+    _currency in tradable_currencies
+    not _restricted_asset
+}
+
+# A trade outside a tradable currency, or touching a restricted asset —
+# explicit deny for every trade action, role and amount (default covers this
+# too; stated for audit clarity). _rbac_deny includes the same condition, so no
+# MANUAL_REVIEW rule routes such a trade to a human either.
+allow = "DENY" if {
+    _is_trade
+    not _admissible_asset
+}
+
+# ---------------------------------------------------------------------------
 # Authorization-claim escalation — hard gate (PR 4, defense-in-depth).
 #
 # Any request where the gateway layer's structural detector
@@ -39,7 +87,7 @@ allowed_roles := {"junior", "senior"}
 # routed to human review, regardless of action, amount, or role.
 #
 # Priority guarantee: this rule is expressed as a hard-negation guard on ALL
-# execute_trade and market_analysis ALLOW rules below (each has
+# trade-action (trade_actions) and market_analysis ALLOW rules below (each has
 # ``not input.claimed_authorization_present``), so the OPA decision set
 # will contain only "MANUAL_REVIEW" — never "ALLOW" — when the flag is true.
 #
@@ -112,26 +160,26 @@ allow = "DENY" if {
 # (From: finance_policy.rego — junior limits are the controlling constraint)
 # ---------------------------------------------------------------------------
 
-# Junior ALLOW: ≤ $5 000, non-BTC
+# Junior ALLOW: ≤ $5 000, no restricted asset
 # Guard: not allowed when an authorization claim is present (defer to MANUAL_REVIEW).
 allow = "ALLOW" if {
-    input.action == "execute_trade"
+    _is_trade
     lower(input.trader_role) == "junior"
     input.amount <= 5000
-    input.currency != "BTC"
+    _admissible_asset
     not input.claimed_authorization_present
     not _speculative_deny
     not _quota_exhausted
     not _quota_below_reserve
 }
 
-# Junior MANUAL_REVIEW: $5 001 – $10 000, non-BTC
+# Junior MANUAL_REVIEW: $5 001 – $10 000, no restricted asset
 allow = "MANUAL_REVIEW" if {
-    input.action == "execute_trade"
+    _is_trade
     lower(input.trader_role) == "junior"
     input.amount > 5000
     input.amount <= 10000
-    input.currency != "BTC"
+    _admissible_asset
     not _speculative_deny
     not _quota_exhausted
 }
@@ -147,28 +195,28 @@ allow = "MANUAL_REVIEW" if {
 #  amount thresholds — senior thresholds happen to be consistent: $500 k)
 # ---------------------------------------------------------------------------
 
-# Senior ALLOW: ≤ $500 000, non-BTC
+# Senior ALLOW: ≤ $500 000, no restricted asset
 # (finance_policy.rego senior limit; consistent with trade_policy.rego
 #  manual_review boundary — no conflict for senior traders at this threshold)
 # Guard: not allowed when an authorization claim is present (defer to MANUAL_REVIEW).
 allow = "ALLOW" if {
-    input.action == "execute_trade"
+    _is_trade
     lower(input.trader_role) == "senior"
     input.amount <= 500000
-    input.currency != "BTC"
+    _admissible_asset
     not input.claimed_authorization_present
     not _quota_exhausted
     not _quota_below_reserve
 }
 
-# Senior MANUAL_REVIEW: $500 001 – $1 000 000, non-BTC
+# Senior MANUAL_REVIEW: $500 001 – $1 000 000, no restricted asset
 # (From: finance_policy.rego — preserves human-in-the-loop for large trades)
 allow = "MANUAL_REVIEW" if {
-    input.action == "execute_trade"
+    _is_trade
     lower(input.trader_role) == "senior"
     input.amount > 500000
     input.amount <= 1000000
-    input.currency != "BTC"
+    _admissible_asset
     not _quota_exhausted
 }
 
@@ -178,12 +226,15 @@ allow = "MANUAL_REVIEW" if {
 # Risk profile rules — semantic mapping
 # (From: finance_policy.rego — risk profile shielding)
 # CAVEAT: These rules fire independently of RBAC; they are secondary controls
-# that gate non-trade actions (e.g. portfolio rebalancing advice).  For
-# execute_trade the RBAC rules above are the primary gate.
+# that gate non-trade actions only (e.g. portfolio rebalancing advice). Every
+# trade action (trade_actions) is gated by the RBAC rules above; excluding
+# them here also keeps a trade in a MANUAL_REVIEW band from matching an ALLOW
+# rule as well (a conflicting value would be an evaluation error).
+# ``input.action != "prompt_injection_check"`` also requires an action.
 # ---------------------------------------------------------------------------
 
 allow = "ALLOW" if {
-    input.action != "execute_trade"
+    not _is_trade
     input.action != "prompt_injection_check"
     lower(input.risk_profile) == "aggressive"
     not input.claimed_authorization_present
@@ -191,7 +242,7 @@ allow = "ALLOW" if {
 }
 
 allow = "ALLOW" if {
-    input.action != "execute_trade"
+    not _is_trade
     input.action != "prompt_injection_check"
     lower(input.risk_profile) == "moderate"
     not input.claimed_authorization_present
@@ -199,7 +250,7 @@ allow = "ALLOW" if {
 }
 
 allow = "ALLOW" if {
-    input.action != "execute_trade"
+    not _is_trade
     input.action != "prompt_injection_check"
     lower(input.risk_profile) == "conservative"
     not input.claimed_authorization_present
@@ -250,14 +301,14 @@ allow = "GOVERNANCE_VIOLATION" if {
 # ---------------------------------------------------------------------------
 
 _quota_exhausted if {
-    input.action == "execute_trade"
+    _is_trade
     quota := input.token_quota
     quota.quota_available == true
     quota.quota_exhausted == true
 }
 
 _quota_below_reserve if {
-    input.action == "execute_trade"
+    _is_trade
     quota := input.token_quota
     quota.quota_available == true
     quota.quota_exhausted == false
@@ -282,20 +333,22 @@ allow = "MANUAL_REVIEW" if {
 
 # Internal helper: primary RBAC gate would deny this request
 _rbac_deny if {
-    input.action == "execute_trade"
+    _is_trade
     lower(input.trader_role) == "junior"
     input.amount > 10000
 }
 
 _rbac_deny if {
-    input.action == "execute_trade"
+    _is_trade
     lower(input.trader_role) == "senior"
     input.amount > 1000000
 }
 
+# A trade outside a tradable currency or touching a restricted asset: neither
+# a human (the MANUAL_REVIEW rules above) nor the RBAC ladder may admit it.
 _rbac_deny if {
-    input.action == "execute_trade"
-    input.currency == "BTC"
+    _is_trade
+    not _admissible_asset
 }
 
 _rbac_deny if {

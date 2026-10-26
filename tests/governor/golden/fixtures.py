@@ -92,6 +92,11 @@ class Scenario:
     narrow_enabled: bool = False
     register_narrower: bool = False
 
+    # The human-review holds the post-approval run's approval was given
+    # against (``PostHitlApproval.approved_holds``): the holds the scenario
+    # parks on when a human is asked.
+    approved_holds: frozenset[tuple[str, str]] = frozenset()
+
 
 class GoldenDummyNarrower(Narrower):
     def can_narrow(self, violation: Any, action: str, params: dict[str, Any]) -> bool:
@@ -340,13 +345,14 @@ SCENARIOS: list[Scenario] = [
         params={"symbol": "AAPL", "amount": 100.0, "confidence": 0.99},
         opa_decision="UNKNOWN_ARBITRARY_VERDICT",
     ),
-    # 9. OPA MANUAL_REVIEW (HITL requirement)
+    # 9. OPA MANUAL_REVIEW (HITL requirement); the approval answers that hold
     Scenario(
         id="09_opa_manual_review",
         description="OPA policy returns MANUAL_REVIEW",
         action="execute_trade",
         params={"symbol": "AAPL", "amount": 100.0, "confidence": 0.99},
         opa_decision="MANUAL_REVIEW",
+        approved_holds=frozenset({("governance", "OPA_MANUAL_REVIEW")}),
     ),
     # 10. OPA Exception
     Scenario(

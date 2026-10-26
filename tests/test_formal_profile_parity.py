@@ -22,9 +22,11 @@ under which profile. Neither imports the other; this test is the bridge.
 import pytest
 
 from proof.model import (
+    JURISDICTION_TIER_PHASE,
     PLUGIN_TIER_PHASE,
     POST_HITL_READ_ONLY_TIERS,
     PROFILES,
+    REVALIDATED_TIERS,
     TIER_PHASE,
     TIERS,
     WARRANT_TIER,
@@ -44,7 +46,9 @@ from src.gateway.governance.governor.pipeline import (
 
 pytestmark = [pytest.mark.unit, pytest.mark.local]
 
-_ALL_PHASES = TIER_PHASE | PLUGIN_TIER_PHASE | WARRANT_TIER_PHASE
+_ALL_PHASES = (
+    TIER_PHASE | PLUGIN_TIER_PHASE | WARRANT_TIER_PHASE | JURISDICTION_TIER_PHASE
+)
 
 
 def test_profile_names_match() -> None:
@@ -56,9 +60,16 @@ def test_profile_names_match() -> None:
 def test_production_predicate_matches_proof(
     profile: Profile, tier: str, phase: int
 ) -> None:
-    """Every (profile, tier, phase), kernel or plugin-named, selects identically."""
+    """Every (profile, tier, phase) selects identically: kernel, plugin-named
+    or jurisdiction tier. The runtime reads a contributed tier's declaration
+    (``revalidated``), the model its name in REVALIDATED_TIERS; the
+    declarations themselves are pinned by
+    ``test_region_tiers_match_proof`` and ``test_jurisdiction_wiring``."""
     assert stage_runs_under(
-        profile, name=tier, mutating=phase == 2
+        profile,
+        name=tier,
+        mutating=phase == 2,
+        revalidated=tier in REVALIDATED_TIERS,
     ) == runs_under_profile(profile.value, tier, phase)
 
 
@@ -76,12 +87,21 @@ def test_post_hitl_read_only_sets_agree_and_are_proof_tiers() -> None:
     )
 
 
+def test_every_jurisdiction_tier_is_revalidated_in_the_model() -> None:
+    """A jurisdiction assessment can change while a human decides: the model
+    revalidates every jurisdiction tier (and only read-only tiers)."""
+    assert frozenset(JURISDICTION_TIER_PHASE) <= REVALIDATED_TIERS
+    assert all(_ALL_PHASES[t] == 1 for t in REVALIDATED_TIERS)
+
+
 def test_warrant_tier_is_the_kernel_warrant_stage() -> None:
     from src.gateway.governance.governor.stages.warrant import WarrantStage
 
     assert WarrantStage.name == WARRANT_TIER
     assert WarrantStage.mutating is (WARRANT_TIER_PHASE[WARRANT_TIER] == 2)
-    assert stage_runs_under(Profile.POST_HITL, name=WarrantStage.name, mutating=False)
+    assert stage_runs_under(
+        Profile.POST_HITL, name=WarrantStage.name, mutating=False, revalidated=False
+    )
     assert post_hitl_rechecks_warrant()
 
 
@@ -94,9 +114,18 @@ def test_post_hitl_claim_holds() -> None:
 
 
 def test_post_hitl_skips_read_only_plugin_tiers() -> None:
-    """Fail-closed scope, not fail-open: a phase-1 plugin tier is not re-run."""
+    """Fail-closed scope, not fail-open: a phase-1 plugin tier that does not
+    declare ``revalidated_after_approval`` is not re-run."""
     assert not stage_runs_under(
-        Profile.POST_HITL, name="clinical_consensus", mutating=False
+        Profile.POST_HITL, name="clinical_consensus", mutating=False, revalidated=False
+    )
+
+
+def test_post_hitl_reruns_a_declared_tier_whatever_its_name() -> None:
+    """Structural, never by name: any read-only tier that declares
+    ``revalidated_after_approval`` re-runs after approval."""
+    assert stage_runs_under(
+        Profile.POST_HITL, name="any_contributed_name", mutating=False, revalidated=True
     )
 
 
@@ -104,7 +133,7 @@ def test_post_hitl_skips_read_only_plugin_tiers() -> None:
 
 from proof.model import (  # noqa: E402
     JURISDICTION_TIERS,
-    jurisdiction_keeps_post_hitl_set,
+    post_hitl_rechecks_jurisdiction,
     region_profile_stages,
     region_tier_phase,
 )
@@ -120,12 +149,17 @@ def test_proof_and_production_know_the_same_regions() -> None:
 
 @pytest.mark.parametrize("region", sorted(JURISDICTION_TIERS))
 def test_region_tiers_match_proof(region: str) -> None:
-    """The production contribution adds exactly the proof's tiers, in the proof's phase."""
+    """The production contribution adds exactly the proof's tiers, in the
+    proof's phase, and every one declares ``revalidated_after_approval`` as
+    the model's REVALIDATED_TIERS says (GHSA-f6xq-23f7-9grm)."""
     contribution = resolve_jurisdiction(region)
     phases = region_tier_phase(region)
     assert tuple(t.tier_name for t in contribution.tiers) == JURISDICTION_TIERS[region]
     assert {t.tier_name: t.phase for t in contribution.tiers} == {
         t: phases[t] for t in JURISDICTION_TIERS[region]
+    }
+    assert {t.tier_name: t.revalidated_after_approval for t in contribution.tiers} == {
+        t: t in REVALIDATED_TIERS for t in JURISDICTION_TIERS[region]
     }
 
 
@@ -137,13 +171,18 @@ def test_region_stage_selection_matches_proof(region: str, profile: Profile) -> 
     selected = frozenset(
         tier
         for tier, phase in phases.items()
-        if stage_runs_under(profile, name=tier, mutating=phase == 2)
+        if stage_runs_under(
+            profile,
+            name=tier,
+            mutating=phase == 2,
+            revalidated=tier in REVALIDATED_TIERS,
+        )
     )
     assert selected == region_profile_stages(region)[profile.value]
 
 
 def test_jurisdiction_claim_holds() -> None:
-    assert jurisdiction_keeps_post_hitl_set()
+    assert post_hitl_rechecks_jurisdiction()
 
 
 # ── Phase-2 gate and the pending-approval outcome (proof claims 8 and 9) ───────
@@ -278,3 +317,177 @@ async def test_pending_approval_outcome_matches_proof(
     assert (decided, result.barrier_preview.value) == pending_approval_outcome(
         phase1, preview
     )
+
+
+# ── After approval: only the approved holds are answered (proof claim 14) ─────
+
+from typing import Any  # noqa: E402
+
+from proof.model import (  # noqa: E402
+    approval_answers_only_its_holds,
+    post_hitl_findings,
+    post_hitl_verdict,
+)
+from src.gateway.governance.contracts import (  # noqa: E402
+    CommitReceipt,
+    MutatingTier,
+    ReadOnlyTier,
+)
+from src.gateway.governance.governor.pipeline import answered_by_approval  # noqa: E402
+from src.gateway.governance.governor.stages.domain_tiers import (  # noqa: E402
+    order_stages,
+)
+
+_PROBE = "revalidated_probe"
+_PROBE_HOLD = (_PROBE, f"{_PROBE.upper()}_HITL")
+
+
+class _RevalidatedProbe(ReadOnlyTier):
+    """A contributed read-only tier that declares revalidation, reporting ``kinds``."""
+
+    tier_name = _PROBE
+    order = 1
+    revalidated_after_approval = True
+
+    def __init__(self, kinds: frozenset[str]) -> None:
+        self._kinds = kinds
+
+    def claims_action(self, action: str, params: dict[str, Any]) -> bool:
+        return True
+
+    async def evaluate(self, action: str, params: dict[str, Any]) -> list[Violation]:
+        return _violations(self.tier_name, self._kinds)
+
+
+class _CommittingBarrier(MutatingTier):
+    """A claiming phase-2 tier that always commits."""
+
+    tier_name = "committing_barrier"
+    order = 1
+
+    def claims_action(self, action: str, params: dict[str, Any]) -> bool:
+        return True
+
+    async def evaluate(self, action: str, params: dict[str, Any]) -> list[Violation]:
+        return []
+
+    async def commit(
+        self, action: str, params: dict[str, Any]
+    ) -> tuple[list[Violation], CommitReceipt | None]:
+        return [], CommitReceipt(tier=self.tier_name, magnitude=1.0)
+
+    async def rollback(
+        self, action: str, params: dict[str, Any], receipt: CommitReceipt
+    ) -> None:
+        return None
+
+    async def confirm(
+        self, action: str, params: dict[str, Any], receipt: CommitReceipt
+    ) -> None:
+        return None
+
+
+def test_approval_holds_claim_holds() -> None:
+    assert approval_answers_only_its_holds()
+
+
+@pytest.mark.parametrize("approved", [False, True], ids=["unapproved", "approved"])
+@pytest.mark.parametrize(
+    "kinds", _KIND_SETS, ids=lambda k: "+".join(sorted(k)) or "clean"
+)
+async def test_post_hitl_answers_what_the_proof_answers(
+    kinds: frozenset[str], approved: bool
+) -> None:
+    """The real pipeline re-runs a declared tier under POST_HITL, answers
+    exactly the holds the approval covers, and commits iff the model seals."""
+    stages = order_stages([_RevalidatedProbe(kinds), _CommittingBarrier()])
+    ctx = StageContext(
+        action="act",
+        params={},
+        profile=Profile.POST_HITL,
+        approved_holds=frozenset({_PROBE_HOLD}) if approved else frozenset(),
+    )
+    async with ReservationScope() as scope:
+        result = await run_pipeline(stages, ctx, profile=Profile.POST_HITL, scope=scope)
+
+    remaining = post_hitl_findings(kinds, approved=approved)
+    assert _PROBE in dict(result.plan)
+    assert frozenset(v.kind.name for v in result.violations) == remaining
+    sealable = post_hitl_verdict(remaining) == "ALLOW"
+    assert result.committed_stages == (("committing_barrier",) if sealable else ())
+
+
+@pytest.mark.parametrize("profile", [Profile.FULL, Profile.DRY_RUN])
+def test_an_approval_answers_nothing_outside_post_hitl(profile: Profile) -> None:
+    hold = Violation(
+        tier=_PROBE_HOLD[0],
+        code=_PROBE_HOLD[1],
+        message="hold",
+        kind=ViolationKind.HITL,
+    )
+    ctx = StageContext(
+        action="act",
+        params={},
+        profile=profile,
+        approved_holds=frozenset({_PROBE_HOLD}),
+    )
+    assert not answered_by_approval(ctx, hold)
+
+
+@pytest.mark.parametrize("kind", [k for k in ViolationKind if k != ViolationKind.HITL])
+def test_an_approval_answers_no_kind_but_hitl(kind: ViolationKind) -> None:
+    """Matching (tier, code) is not enough: only a HITL finding is answered."""
+    finding = Violation(
+        tier=_PROBE_HOLD[0], code=_PROBE_HOLD[1], message="x", kind=kind
+    )
+    ctx = StageContext(
+        action="act",
+        params={},
+        profile=Profile.POST_HITL,
+        approved_holds=frozenset({_PROBE_HOLD}),
+    )
+    assert not answered_by_approval(ctx, finding)
+
+
+class _StaticPolicy:
+    """A policy client answering one verdict for every input."""
+
+    def __init__(self, verdict: str) -> None:
+        self._verdict = verdict
+
+    async def evaluate_policy(self, input_data: dict[str, Any], **kwargs: Any) -> str:
+        return self._verdict
+
+
+_OPA_HOLD = ("governance", "OPA_MANUAL_REVIEW")
+
+
+@pytest.mark.parametrize("approved", [False, True], ids=["unapproved", "approved"])
+async def test_post_hitl_answers_opa_manual_review_only_when_approved(
+    approved: bool,
+) -> None:
+    """OPA is a re-run read-only stage like any other: its MANUAL_REVIEW hold
+    is answered iff the approval was given against it, and phase 2 commits
+    iff the model seals (``post_hitl_findings({"HITL"}, approved=...)``)."""
+    from src.gateway.governance.governor.stages.opa import OpaStage
+
+    stages = (
+        OpaStage(_StaticPolicy("MANUAL_REVIEW")),
+        *order_stages([_CommittingBarrier()]),
+    )
+    ctx = StageContext(
+        action="act",
+        params={},
+        profile=Profile.POST_HITL,
+        approved_holds=frozenset({_OPA_HOLD}) if approved else frozenset(),
+    )
+    async with ReservationScope() as scope:
+        result = await run_pipeline(stages, ctx, profile=Profile.POST_HITL, scope=scope)
+
+    remaining = post_hitl_findings(frozenset({"HITL"}), approved=approved)
+    assert frozenset(v.kind.name for v in result.violations) == remaining
+    assert [v.code for v in result.violations] == (
+        [] if approved else ["OPA_MANUAL_REVIEW"]
+    )
+    sealable = post_hitl_verdict(remaining) == "ALLOW"
+    assert result.committed_stages == (("committing_barrier",) if sealable else ())

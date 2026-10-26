@@ -380,6 +380,27 @@ class GovernanceTier(ABC):
         """
         return ()
 
+    @property
+    def revalidated_after_approval(self) -> bool:
+        """Whether the tier re-runs when an approved request is revalidated.
+
+        ``SymbolicGovernor.revalidate_post_hitl()`` (the ``POST_HITL``
+        profile) re-runs every :class:`MutatingTier`: it reserves state, so
+        the committing run must re-commit it. A :class:`ReadOnlyTier`
+        re-runs only when it returns ``True`` here, because its verdict rests
+        on something that can change while a human decides (for example an
+        external authority's determination that can be revoked, or an
+        assessment that can expire). Under ``POST_HITL`` such a tier's HITL
+        finding is answered only if the approval being redeemed was given
+        against it (``PostHitlApproval.approved_holds``); every other finding
+        stands.
+
+        Derived from the kind by default (``True`` for a mutating tier,
+        ``False`` for a read-only one); a read-only tier opts in by
+        overriding it. Selection stays structural, never by tier name.
+        """
+        return self.phase == 2
+
     @abstractmethod
     def claims_action(self, action: str, params: dict[str, Any]) -> bool:
         """Return True if this tier has governance authority over the action."""

@@ -173,21 +173,33 @@ PLUGIN_TIER_PHASE: dict[str, int] = {"domain_barrier": 2}
 WARRANT_TIER = "warrant"
 WARRANT_TIER_PHASE: dict[str, int] = {WARRANT_TIER: 1}
 
-# Read-only tiers re-checked after approval: policy may change, and a warrant
-# may be revoked, while the request waits (TOCTOU).
+# Kernel read-only tiers re-checked after approval: policy may change, and a
+# warrant may be revoked, while the request waits (TOCTOU).
 POST_HITL_READ_ONLY_TIERS: frozenset[str] = frozenset({"opa", WARRANT_TIER})
+
+# Contributed read-only tiers that declare ``revalidated_after_approval``
+# (``GovernanceTier``): their verdict is an external authority's assessment,
+# which can be revoked or expire while a human reviews the request, so
+# POST_HITL re-runs them too (GHSA-f6xq-23f7-9grm). Every jurisdiction tier is
+# one (``JurisdictionContribution`` refuses a tier that is not; claim 10).
+# Parity with the runtime declarations: ``tests/test_formal_profile_parity.py``.
+REVALIDATED_TIERS: frozenset[str] = frozenset({"fria"})
 
 
 def runs_under_profile(profile: str, tier: str, phase: int) -> bool:
     """Whether ``tier`` (in pipeline ``phase``) runs under ``profile``.
 
-    Structural, never by name: POST_HITL runs every phase-2 tier plus the
-    read-only tiers in POST_HITL_READ_ONLY_TIERS; FULL and DRY_RUN run all.
-    Mirrored by ``src/gateway/governance/governor/pipeline.py::stage_runs_under``
+    POST_HITL runs every phase-2 tier, the kernel read-only tiers in
+    POST_HITL_READ_ONLY_TIERS and the revalidated tiers in REVALIDATED_TIERS;
+    FULL and DRY_RUN run all. Mirrored by
+    ``src/gateway/governance/governor/pipeline.py::stage_runs_under``, which
+    selects contributed tiers by their declaration, never by name
     (``tests/test_formal_profile_parity.py``).
     """
     if profile == "POST_HITL":
-        return phase == 2 or tier in POST_HITL_READ_ONLY_TIERS
+        return (
+            phase == 2 or tier in POST_HITL_READ_ONLY_TIERS or tier in REVALIDATED_TIERS
+        )
     return True
 
 
@@ -226,7 +238,8 @@ JURISDICTION_TIERS: dict[str, tuple[str, ...]] = {
 }
 
 # Jurisdiction tiers are assessments, never barriers: phase 1 (read-only).
-# ``JurisdictionContribution`` refuses any other phase at construction.
+# ``JurisdictionContribution`` refuses any other phase at construction, and
+# any tier that is not revalidated after approval (REVALIDATED_TIERS, claim 10).
 JURISDICTION_TIER_PHASE: dict[str, int] = {"fria": 1}
 
 
@@ -266,21 +279,31 @@ def jurisdiction_tiers_are_read_only() -> bool:
     )
 
 
-def jurisdiction_keeps_post_hitl_set() -> bool:
-    """Claim: no region changes what POST_HITL re-runs, and every region's
-    POST_HITL still re-runs every phase-2 tier (a phase-1 tier adds nothing
-    after approval and removes nothing)."""
+def post_hitl_rechecks_jurisdiction() -> bool:
+    """Claim: every region's POST_HITL re-runs the region's jurisdiction tiers.
+
+    A jurisdiction tier is an external authority's assessment, which can be
+    revoked or expire while a human reviews a held request, so every one is
+    revalidated (REVALIDATED_TIERS). POST_HITL therefore runs the universal
+    POST_HITL set plus exactly the region's obligations, and still re-runs
+    every phase-2 tier, kernel or plugin-named. FULL and DRY_RUN run the
+    obligations too, so no seal skips them on any path (GHSA-f6xq-23f7-9grm;
+    replaces the claim that jurisdiction tiers left the POST_HITL set
+    unchanged, which is how a revocation during review went unseen).
+    """
     for region in JURISDICTION_TIERS:
+        obligations = frozenset(JURISDICTION_TIERS[region])
+        if not obligations <= REVALIDATED_TIERS:
+            return False
         stages = region_profile_stages(region)
-        if stages["POST_HITL"] != PROFILE_STAGES["POST_HITL"]:
+        if stages["POST_HITL"] != PROFILE_STAGES["POST_HITL"] | obligations:
             return False
         phases = region_tier_phase(region) | PLUGIN_TIER_PHASE
         if not all(
             runs_under_profile("POST_HITL", t, p) for t, p in phases.items() if p == 2
         ):
             return False
-        # FULL and DRY_RUN run the region's obligations: no seal skips them.
-        if not set(JURISDICTION_TIERS[region]) <= stages["FULL"] & stages["DRY_RUN"]:
+        if not obligations <= stages["FULL"] & stages["DRY_RUN"]:
             return False
     return True
 
@@ -529,6 +552,62 @@ def post_hitl_rechecks_warrant() -> bool:
                 "ALLOW",
                 "NARROW",
             ):
+                return False
+    return True
+
+
+def post_hitl_findings(kinds: frozenset[str], *, approved: bool) -> frozenset[str]:
+    """What a re-run read-only tier still reports against an approved request.
+
+    ``approved``: the approval being redeemed was given against this tier's
+    HITL hold (``PostHitlApproval.approved_holds``). An approval answers
+    exactly the holds the reviewer was shown, so such a hold is dropped.
+    Every other finding stands: HARD denies, RELIANCE_INELIGIBLE defers, and
+    a hold the reviewer never saw (it appeared while the request waited) is
+    not answered. Mirrored by ``pipeline.py::answered_by_approval``
+    (``tests/test_formal_profile_parity.py``).
+    """
+    return kinds - {"HITL"} if approved else kinds
+
+
+def post_hitl_verdict(kinds: frozenset[str]) -> str:
+    """The verdict of a POST_HITL run whose stages still report ``kinds``.
+
+    Mirrors ``SymbolicGovernor.revalidate_post_hitl``: nothing is narrowed or
+    parked for a human after approval. A clean run seals (ALLOW), a
+    RELIANCE_INELIGIBLE finding without HARD defers with the approval kept,
+    and anything else denies.
+    """
+    if not kinds:
+        return "ALLOW"
+    if RELIANCE_KIND in kinds and "HARD" not in kinds:
+        return "DEFER"
+    return "DENY"
+
+
+def approval_answers_only_its_holds() -> bool:
+    """Claim: after approval, only the holds the reviewer was shown are answered.
+
+    For every set of kinds a re-run read-only tier can report under
+    POST_HITL, approved against its hold or not: the run seals iff the tier
+    reported nothing but holds the approval covers; a HARD finding (e.g. an
+    authority that now refuses) always denies; a RELIANCE_INELIGIBLE finding
+    without HARD always defers; and phase 2 commits iff the run seals. So a
+    revocation observed at revalidation is never sealed, and an approved hold
+    does not block its own approval (GHSA-f6xq-23f7-9grm).
+    """
+    for kinds in _kind_sets():
+        for approved in (False, True):
+            remaining = post_hitl_findings(kinds, approved=approved)
+            verdict = post_hitl_verdict(remaining)
+            sealed = verdict == "ALLOW"
+            if sealed != (kinds <= {"HITL"} and (approved or "HITL" not in kinds)):
+                return False
+            if "HARD" in kinds and verdict != "DENY":
+                return False
+            if RELIANCE_KIND in kinds and "HARD" not in kinds and verdict != "DEFER":
+                return False
+            if (phase2_mode("POST_HITL", remaining) == "COMMIT") != sealed:
                 return False
     return True
 
@@ -1326,6 +1405,10 @@ def main() -> None:
         "  POST_HITL re-checks the warrant (revocation after approval refused): "
         f"{warrant_toctou_ok}"
     )
+    holds_ok = approval_answers_only_its_holds()
+    print(
+        f"  POST_HITL answers only the holds the approval was given against: {holds_ok}"
+    )
 
     # Verify profile ALLOW property
     # under every profile, an ALLOW (SEAL_ISSUED) requires every tier in that profile to PASS.
@@ -1379,9 +1462,12 @@ def main() -> None:
             f"No-Direct-Bind={holds}  seal requires obligations={sealed_ok}"
         )
     read_only = jurisdiction_tiers_are_read_only()
-    post_hitl_unchanged = jurisdiction_keeps_post_hitl_set()
+    post_hitl_rechecks_obligations = post_hitl_rechecks_jurisdiction()
     print(f"  Every jurisdiction tier is phase 1: {read_only}")
-    print(f"  POST_HITL set unchanged in every region: {post_hitl_unchanged}")
+    print(
+        "  POST_HITL re-runs every region's jurisdiction tiers: "
+        f"{post_hitl_rechecks_obligations}"
+    )
     # The universal model is untouched by the regional enumerations.
     universal_after = len(enumerate_reachable(gated_transitions))
     print(f"  Universal gated model still {universal_after} states")
@@ -1406,6 +1492,10 @@ def main() -> None:
     )
     assert warrant_toctou_ok, (
         "PROOF FAILED: a warrant revoked after approval can still be sealed!"
+    )
+    assert holds_ok, (
+        "PROOF FAILED: POST_HITL answers a finding the approval was not given "
+        "against, or a HARD finding reaches a seal!"
     )
     assert profile_allow_valid, (
         "PROOF FAILED: SEAL_ISSUED requires all profile tiers to pass!"
@@ -1441,8 +1531,8 @@ def main() -> None:
         == len(gated_states)
     ), "PROOF FAILED: a region without obligations changed the state space!"
     assert read_only, "PROOF FAILED: a jurisdiction tier is not phase 1!"
-    assert post_hitl_unchanged, (
-        "PROOF FAILED: a jurisdiction tier changes the POST_HITL set!"
+    assert post_hitl_rechecks_obligations, (
+        "PROOF FAILED: a region's POST_HITL skips one of its jurisdiction tiers!"
     )
     assert universal_after == len(gated_states), (
         "PROOF FAILED: regional enumeration leaked!"
@@ -1471,8 +1561,11 @@ def main() -> None:
     print("     barrier_preview PASS/FAIL (hard_preview_denies_before_hitl).")
     print(" 10. Per region (JURISDICTION_TIERS), No-Direct-Bind still holds, no seal")
     print("     is issued unless the region's obligations passed (fria under EU_ECB),")
-    print("     and the phase-1 jurisdiction tiers leave the POST_HITL set unchanged")
-    print(f"     (EU_ECB: {region_results['EU_ECB'][0]} states).")
+    print("     and POST_HITL re-runs every jurisdiction tier, so an assessment")
+    print("     revoked while a human decides is observed before any seal")
+    print(
+        f"     (post_hitl_rechecks_jurisdiction; EU_ECB: {region_results['EU_ECB'][0]} states)."
+    )
     print(" 11. Verdict lattice (verdict_of, parity with ClassificationEngine): HARD")
     print("     always denies, RELIANCE_INELIGIBLE defers, DEFER otherwise needs")
     print("     low confidence, and only ALLOW/NARROW reach SEAL_ISSUED")
@@ -1485,6 +1578,10 @@ def main() -> None:
     print("     approval and execution (as observed through the <= 60 s freshness")
     print("     window) commits nothing and is never sealed")
     print("     (post_hitl_rechecks_warrant).")
+    print(" 14. After approval only the holds the reviewer was shown are answered:")
+    print("     a re-run tier's HARD finding denies, RELIANCE_INELIGIBLE defers, a")
+    print("     hold the approval was not given against refuses, and phase 2")
+    print("     commits iff the run seals (approval_answers_only_its_holds).")
     print()
     print("PLAUSIBLE (not proved here):")
     print("  That this model generalises to the full production CAGE stack.")

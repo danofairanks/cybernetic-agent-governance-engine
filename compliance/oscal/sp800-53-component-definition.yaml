@@ -30,7 +30,7 @@ component-definition:
     title: "Cybernetic Governance Engine — NIST SP 800-53 Rev 5 Component Definition"
     version: "1.0.0"
     oscal-version: "1.0.4"
-    last-modified: "2026-03-06T00:00:00Z"
+    last-modified: "2026-10-25T23:30:57Z"
     remarks: >
       This component definition maps technical enforcement components to
       NIST SP 800-53 Rev 5 HIGH-baseline controls. Each implemented requirement
@@ -975,7 +975,7 @@ component-definition:
                 The policy grants permissions based on user role (junior_analyst, senior_analyst,
                 compliance_officer, admin) with graduated fiscal limits: junior analysts are
                 limited to $5,000 per trade and $10,000 daily aggregate; senior analysts to
-                $500,000 and $1,000,000 respectively. Fiscal limit checks in finance_policy.rego
+                $500,000 and $1,000,000 respectively. Fiscal limit checks in src/cage_finance/opa/trade_governance.rego
                 enforce per-user-class constraints. Users cannot escalate their own permissions;
                 all role assignments are managed via Kubernetes RBAC and propagated to OPA
                 via environment configuration.

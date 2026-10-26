@@ -56,6 +56,11 @@ class StageContext:
     params: Mapping[str, Any]
     profile: Profile
     opa_verdict: OpaVerdict | None = None
+    # POST_HITL only: ``(tier, code)`` of every human-review hold the approval
+    # being redeemed was given against (``PostHitlApproval.approved_holds``).
+    # ``run_pipeline`` answers a read-only stage's HITL finding iff it is one
+    # of these (:func:`answered_by_approval`). Empty answers nothing.
+    approved_holds: frozenset[tuple[str, str]] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -97,6 +102,13 @@ class Stage(Protocol):
     keep per-request state on itself — neither a ``CommitReceipt`` (the
     request's ``ReservationScope`` holds those) nor a decoded result (return
     a ``StageOutput``).
+
+    A read-only stage may set ``revalidated_after_approval = True`` when its
+    verdict can change while a human decides, so ``POST_HITL`` re-runs it
+    (:func:`stage_runs_under`). ``DomainTierStage`` copies the value from its
+    tier (``GovernanceTier.revalidated_after_approval``); a stage without the
+    attribute is not re-run after approval unless the kernel names it in
+    :data:`POST_HITL_READ_ONLY_STAGES`.
     """
 
     name: str
@@ -193,10 +205,13 @@ def _outcome(stage_violations: Sequence[Violation]) -> str:
     return StageOutcome.FAIL.value if stage_violations else StageOutcome.PASS.value
 
 
-#: Read-only stages re-run after human approval (TOCTOU): policy may have
-#: changed, or a warrant been revoked, while the request waited. Mirrors
+#: Kernel read-only stages re-run after human approval (TOCTOU): policy may
+#: have changed, or a warrant been revoked, while the request waited. Mirrors
 #: ``proof/model.py::POST_HITL_READ_ONLY_TIERS``; ``warrant`` is the kernel
 #: ``WarrantStage`` (present only when a region marks a norm requires_warrant).
+#: A contributed read-only tier is never listed here: its name belongs to a
+#: plugin or a jurisdiction, so it declares ``revalidated_after_approval``
+#: instead (see :func:`stage_runs_under`).
 POST_HITL_READ_ONLY_STAGES: frozenset[str] = frozenset({"opa", "warrant"})
 
 #: The only stages an action no domain tier claims runs through.  Mirrors
@@ -204,18 +219,49 @@ POST_HITL_READ_ONLY_STAGES: frozenset[str] = frozenset({"opa", "warrant"})
 UNGOVERNED_STAGES: frozenset[str] = frozenset({"ftra", "stpa", "opa"})
 
 
-def stage_runs_under(profile: Profile, *, name: str, mutating: bool) -> bool:
-    """Whether a stage runs under ``profile`` — decided by structure, not by name.
+def stage_runs_under(
+    profile: Profile, *, name: str, mutating: bool, revalidated: bool
+) -> bool:
+    """Whether a stage runs under ``profile``.
 
-    FULL and DRY_RUN run every stage. POST_HITL runs the read-only stages in
-    :data:`POST_HITL_READ_ONLY_STAGES` plus **every** mutating (phase-2)
-    stage, so a plugin-named barrier (``dose_barrier``, ``bounding``) re-checks
-    after approval exactly like ``cbf`` and ``fiscal``. Mirrors
+    FULL and DRY_RUN run every stage. POST_HITL runs:
+
+    * **every** mutating (phase-2) stage, so a plugin-named barrier
+      (``dose_barrier``) re-checks after approval exactly like ``cbf`` and
+      ``fiscal``;
+    * every read-only stage that declares ``revalidated_after_approval``
+      (``revalidated``): a contributed tier whose verdict can change while a
+      human decides, e.g. an external authority's determination that can be
+      revoked in the meantime;
+    * the kernel read-only stages in :data:`POST_HITL_READ_ONLY_STAGES`.
+
+    Contributed tiers are selected by structure, never by name. Mirrors
     ``proof/model.py::runs_under_profile`` (``tests/test_formal_profile_parity.py``).
     """
     if profile == Profile.POST_HITL:
-        return mutating or name in POST_HITL_READ_ONLY_STAGES
+        return mutating or revalidated or name in POST_HITL_READ_ONLY_STAGES
     return True
+
+
+def answered_by_approval(ctx: StageContext, violation: Violation) -> bool:
+    """Whether the approval being redeemed answers a read-only stage's finding.
+
+    Only in a POST_HITL run, only a HITL finding, and only a hold the approval
+    was given against (``ctx.approved_holds``, matched on ``(tier, code)``):
+    the reviewer was shown that hold and approved the request anyway. Every
+    other finding stands. A HARD finding denies, a RELIANCE_INELIGIBLE finding
+    defers, and a hold that appeared while the request waited was never
+    approved, so the run is refused and needs a fresh approval. This is the
+    only place a hold is answered: no stage drops its own HITL finding under
+    POST_HITL (``OpaStage`` reports ``OPA_MANUAL_REVIEW`` in every profile).
+    Mirrors ``proof/model.py::post_hitl_findings``
+    (``tests/test_formal_profile_parity.py``).
+    """
+    return (
+        ctx.profile == Profile.POST_HITL
+        and violation.kind == ViolationKind.HITL
+        and (violation.tier, violation.code) in ctx.approved_holds
+    )
 
 
 def phase2_mode(profile: Profile, phase1_kinds: Iterable[ViolationKind]) -> Phase2Mode:
@@ -330,13 +376,17 @@ async def run_pipeline(
     claimed_ids = {id(s) for s in claims.claimed}
 
     # b. Select the stages that run under this profile (stage_runs_under).
-    #    Structural, never by name: domain tiers carry plugin-chosen names
-    #    (e.g. "dose_barrier"), and a name filter would silently skip them.
+    #    Structural, never by name: domain and jurisdiction tiers carry
+    #    contributor-chosen names (e.g. "dose_barrier"), and a name filter
+    #    would silently skip them.
     profile_stages = []
     claimed_domains = []
     for s in stages:
         if not stage_runs_under(
-            profile, name=s.name, mutating=bool(getattr(s, "mutating", False))
+            profile,
+            name=s.name,
+            mutating=bool(getattr(s, "mutating", False)),
+            revalidated=bool(getattr(s, "revalidated_after_approval", False)),
         ):
             continue
         if getattr(s, "claims", None) is None:
@@ -397,9 +447,17 @@ async def run_pipeline(
         return await scope.commit(stage, stage_ctx)
 
     # b. Read-only stages
+    answered: list[Violation] = []
     for stage in read_only:
         output = await run_stage(stage, current_ctx)
-        stage_violations = list(output.violations)
+        # POST_HITL: a hold the approval was given against is answered here,
+        # before phase2_mode decides; every other finding stands.
+        stage_violations: list[Violation] = []
+        for v in output.violations:
+            if answered_by_approval(current_ctx, v):
+                answered.append(v)
+            else:
+                stage_violations.append(v)
 
         # Per-request facts come back in the StageOutput, never off the
         # (shared) stage instance.
@@ -418,6 +476,14 @@ async def run_pipeline(
         if hard_violations:
             # Stop at the first HARD violation
             break
+
+    if answered:
+        # Observable, though no longer a finding: which holds the approval
+        # being redeemed answered.
+        span.set_attribute(
+            "governance.approval_answered_holds",
+            [f"{v.tier}/{v.code}" for v in answered],
+        )
 
     # c. Phase 2, gated on the kinds phase 1 reported (phase2_mode).
     mode = phase2_mode(profile, (v.kind for v in violations))

@@ -75,7 +75,9 @@ def test_profile_stages_match_proof_tiers():
         return frozenset(
             t
             for t in TIERS
-            if stage_runs_under(profile, name=t, mutating=TIER_PHASE[t] == 2)
+            if stage_runs_under(
+                profile, name=t, mutating=TIER_PHASE[t] == 2, revalidated=False
+            )
         )
 
     assert selected(Profile.FULL) == proof_tiers

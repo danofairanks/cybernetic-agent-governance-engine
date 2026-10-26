@@ -64,6 +64,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from src.gateway.governance.contracts import ViolationKind
 from src.gateway.infrastructure.redis_single_use import new_op_id
 
 logger = logging.getLogger(__name__)
@@ -417,6 +418,29 @@ class DeferToken(BaseModel):
         """
         value = self.opa_input_snapshot.get("barrier_preview")
         return None if value is None else str(value)
+
+    @property
+    def hitl_holds(self) -> frozenset[tuple[str, str]]:
+        """The human-review holds the reviewer was shown when the token was parked.
+
+        ``(tier, code)`` of every ``hitl`` finding in the parked decision
+        (``opa_input_snapshot["violations"]``). A post-approval run answers
+        exactly these (``PostHitlApproval.approved_holds``). A finding that
+        cannot be read contributes nothing, so a hold missing here is never
+        answered (fail closed).
+        """
+        holds: set[tuple[str, str]] = set()
+        for finding in self.opa_input_snapshot.get("violations") or ():
+            if not isinstance(finding, dict):
+                continue
+            tier, code = finding.get("tier"), finding.get("code")
+            if (
+                finding.get("kind") == ViolationKind.HITL.value
+                and isinstance(tier, str)
+                and isinstance(code, str)
+            ):
+                holds.add((tier, code))
+        return frozenset(holds)
 
     def model_post_init(self, __context: Any) -> None:
         """Post-init: derive correlation_id and wire quorum threshold."""

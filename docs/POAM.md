@@ -3,7 +3,7 @@
 **System:** Cybernetic AI Governance Engine (CAGE)
 **Document:** Public Security Posture Statement
 **Frameworks:** NIST SP 800-53 Rev. 5, NIST AI 600-1, ISO 42001, EU AI Act, DORA, GDPR, MAS FEAT, MAS TRM, MAS Notice 655
-**Last Updated:** 2026-10-07
+**Last Updated:** 2026-10-25
 
 ---
 
@@ -94,6 +94,7 @@ The following findings are tracked as open items with target remediation dates. 
 | EU-GDPR-001 | GDPR Art. 22 | Compliance bridge endpoint for GDPR human oversight of automated decisions not yet implemented | High | 2026-12-31 |
 | EU-001 | EU AI Act Art. 27 | FRIA gating normative provider is in stub mode; external compliance validation provider not yet configured for EU_ECB | High | 2026-12-31 |
 | POAM-2026-099 | EU AI Act Art. 27 / SI-10 | FRIA (`CTRL_FRIA_006`) was never enforced: from v2.0.0-dev.1 (2026-06-01) `enforce_fria_boundary()` had no pipeline caller, so no EU_ECB decision consulted an impact assessment. Remediated in `refactor/fria-jurisdiction` by the EU_ECB-only `fria` jurisdiction tier; closes at merge | High | 2026-10-15 |
+| POAM-2026-113 | EU AI Act Art. 27 / AC-3 / SI-10 | The provider_01 FRIA authority request is built from self-asserted facts: `mandate_status`, `kya_status` and `actor_authenticated` are constants (`ACTIVE`, `VERIFIED`, `true`), and the mandate, screening, counterparty and account fields come from request params with permissive defaults (`DEFAULT-MANDATE`, 1,000,000, `2099-12-31`, `CLEAR`). The partner's determination can therefore rest on facts nobody verified. Reported in GHSA-f6xq-23f7-9grm by Dominik Blain (Ironproof); open pending a partner wire-contract revision and over-the-wire conformance | Moderate | 2026-12-31 |
 
 ### APAC MAS Region (APAC_MAS)
 
@@ -469,6 +470,7 @@ From `v2.0.0-dev.1` (commit `1902c92`, 2026-06-01) until `refactor/fria-jurisdic
 3. `enforce_fria_boundary()` and `FRIAEnforcementResult` are deleted. The universal band is renamed `confidence.agent_threshold` / `confidence.defer_floor` ([`BREAKING_CHANGES_v3.md`](BREAKING_CHANGES_v3.md) P6-1).
 4. `ControlRegistry.reconfigure()` no longer resets `active_region` to the default after loading a region. Without this fix, a reconfigured EU_ECB registry would have assembled without the `fria` tier.
 5. Verified by [`tests/governor/test_jurisdiction_wiring.py`](../tests/governor/test_jurisdiction_wiring.py), which observes each fail-closed path failing, and by the `JURISDICTION_TIERS` sub-proof in [`proof/model.py`](../proof/model.py), with parity in [`tests/test_formal_profile_parity.py`](../tests/test_formal_profile_parity.py). [`compliance/lula/lula-validation-eu-fria.yaml`](../compliance/lula/lula-validation-eu-fria.yaml) now also asserts `CAGE_DEPLOYMENT_REGION=EU_ECB`.
+6. (GHSA-f6xq-23f7-9grm) The tier was not re-run after a human approval, so a determination revoked while a request was held was never observed before the seal. Jurisdiction tiers now declare `revalidated_after_approval` and POST_HITL re-runs them; a `FRIA_EXTERNAL_HOLD` is answered only by an approval given against it (`PostHitlApproval.approved_holds`). The provider payload now carries the verified workload identity (`actor_id` / `operator_urn`) and the trace id (`correlation_id`). Proof claims 10 (`post_hitl_rechecks_jurisdiction`) and 14 (`approval_answers_only_its_holds`), with runtime parity and scenario tests in the files above.
 
 **Remaining Closure Criteria:**
 1. Merge `refactor/fria-jurisdiction`; record the merge commit SHA and the actual merge date here.
@@ -520,6 +522,28 @@ The SBOM/CVE Trivy scan ([`sbom.yml`](../.github/workflows/sbom.yml)) failed on 
 
 **Remaining Closure Criteria:**
 1. Merge `fix/ci-test-errors`. Record the merge commit SHA, and the date all three SBOM/CVE legs pass on `main`, here.
+
+### POAM-2026-113: provider_01 Authority Request Facts Are Self-Asserted (EU_ECB)
+
+**Control:** EU AI Act Art. 27 (`CTRL_FRIA_006`), NIST AC-3, SI-10
+**Risk Level:** Moderate
+**Status:** Open
+**Date Opened:** 2026-10-25
+**Target Closure:** 2026-12-31
+**Reported by:** Dominik Blain (`@dom-omg`), Ironproof, in GHSA-f6xq-23f7-9grm. Thank you.
+
+**Description:**
+[`_build_cage_authority_request()`](../src/integrations/provider_01/provider.py) maps the kernel's FRIA payload to the partner's 37-field authority request. Three facts the partner relies on are constants: `mandate_status: "ACTIVE"`, `kya_status: "VERIFIED"` and `actor_authenticated: true`. The mandate (`mandate_id`, `mandate_max_amount`, `mandate_currency`, `mandate_valid_until`, `permitted_source_accounts`, `permitted_counterparty_class`), screening (`screening_status`, `screening_captured_at`, `screening_max_age_seconds`, `screening_source`) and counterparty/account state come from request params, with permissive defaults when absent (`DEFAULT-MANDATE`, 1,000,000, `2099-12-31T23:59:59Z`, `UNRESTRICTED`, `CLEAR`, now). `target` is read from a top-level envelope field that the kernel payload does not carry, so it goes out empty on the governor path. Request params are partly caller-controlled, so the external authority can be asked to decide on facts that nobody verified. The GHSA-f6xq-23f7-9grm fix made the kernel send the verified workload identity (`actor_id` / `operator_urn`) and trace id; it deliberately left this mapping unchanged, because provider_01 is a partner-built Tier 1 adapter on the frozen Phase 3 v0.2 wire contract, every change to it must be validated over the wire against the partner sandbox (AGENTS.md), and the Step 1 harness uses these params to simulate an expired mandate and stale screening.
+
+**Remediation Plan:**
+1. Derive `actor_authenticated` and `kya_status` from the verified workload identity in the payload (false / unverified when `operator_urn` is empty), never from constants.
+2. Stop defaulting mandate, screening, counterparty and account facts, and populate `target` from a server-bound route. Either resolve these facts server-side from a posture-completing reference source (deterministically seeded, with fault injection for every fail-closed path), or omit them so the partner resolves its own records; a request missing a required fact fails closed in the adapter.
+3. Agree the change with the partner as a wire-contract revision, and update [`FLOWSIGNAL_PARTNER_SPECIFICATION.md`](partners/provider_01/FLOWSIGNAL_PARTNER_SPECIFICATION.md) bilaterally.
+
+**Closure Criteria:**
+1. The partner has adopted the revised contract, and an over-the-wire conformance run against the partner sandbox covers ALLOW, REFUSE, ESCALATE and every fail-closed path.
+2. The Step 1 harness ([`verify_flowsignal_wire_and_hostile.py`](../scripts/verify_flowsignal_wire_and_hostile.py)) is re-run live without injecting mandate or screening facts through params.
+3. Record the merge commit SHA and the actual date of the live run here.
 
 ### POAM-2026-112: Deferral Envelope Wrapping and Evidence Format Normalization
 

@@ -34,9 +34,11 @@ from src.gateway.governance.jurisdiction.contribution import (
 from src.gateway.governance.jurisdiction.eu_ai_act.fria_tier import (
     ActionClaim,
     AssessmentLookup,
+    CallerIdentity,
     FriaTier,
 )
 from src.gateway.governance.seams.normative import NormativeProvider
+from src.gateway.server.workload_identity import current_client_identity
 
 REGION = "EU_ECB"
 
@@ -119,10 +121,14 @@ def contribution(
     provider: NormativeProvider | None = None,
     assessment_lookup: AssessmentLookup = registry_assessment_lookup,
     claims: ActionClaim | None = None,
+    caller_identity: CallerIdentity = current_client_identity,
 ) -> JurisdictionContribution:
     """The EU contribution: one ``fria`` tier plus its posture requirement.
 
     ``provider`` defaults to ``get_normative_provider()`` (``CAGE_NORMATIVE_PROVIDER``).
+    ``caller_identity`` defaults to the workload identity the gateway verified
+    for the request being served (``current_client_identity``), so the
+    provider is told who is acting, never a value from the request body.
     """
     if provider is None:
         from src.gateway.governance.normative_provider import get_normative_provider
@@ -135,6 +141,7 @@ def contribution(
         reassessment_interval_days=load_reassessment_interval_days(),
         gate_timeout_seconds=gate_timeout_seconds(),
         claims=claims,
+        caller_identity=caller_identity,
     )
     return JurisdictionContribution(
         region=REGION,

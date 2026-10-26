@@ -216,6 +216,7 @@ The External Normative Provider (`src/gateway/governance/normative_provider.py`)
 - Missing / stale FRIA artefact, or provider timeout / error: HARD deny (`FRIA_ASSESSMENT_STALE`, `FRIA_PROVIDER_UNAVAILABLE`).
 - Provider refusal with `needs_human_review`: HITL (`FRIA_EXTERNAL_HOLD`) → `REQUIRE_APPROVAL`.
 - Any other refusal: HARD deny (`FRIA_REJECTED`).
+- After a human approval the tier re-runs before the seal (`revalidated_after_approval`): a HARD finding denies, and a `FRIA_EXTERNAL_HOLD` the approval was not given against is refused (`APPROVAL_CONTEXT_DRIFT`).
 
 ### 6.4 Heterogeneous Consensus (AARM-V9)
 For trades $\ge \$10,000\text{ USD}$, `ConsensusModelRegistry` queries two heterogeneous models concurrently via `asyncio.gather()`:

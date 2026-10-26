@@ -19,7 +19,6 @@ from src.gateway.governance.constants import ControlRegistry, GovernanceControl
 from src.gateway.governance.contracts import PolicyClient, Violation, ViolationKind
 from src.gateway.governance.governor.pipeline import (
     OpaVerdict,
-    Profile,
     Stage,
     StageContext,
     StageOutput,
@@ -80,6 +79,13 @@ class OpaStage(Stage):
     Returns a :class:`StageOutput` carrying the decoded verdict (``None`` when
     OPA failed or answered something undecodable); the instance is shared
     across requests and holds nothing about any one of them.
+
+    ``MANUAL_REVIEW`` is a HITL finding (``OPA_MANUAL_REVIEW``) under every
+    profile. The stage never decides whether a human already answered it:
+    after approval (``POST_HITL``) ``run_pipeline`` answers it only if the
+    approval being redeemed was given against it
+    (:func:`~src.gateway.governance.governor.pipeline.answered_by_approval`),
+    so a review OPA first asks for while the request waited refuses the run.
     """
 
     name = "opa"
@@ -108,17 +114,12 @@ class OpaStage(Stage):
             )
 
         return StageOutput(
-            violations=tuple(_violations_for(verdict, raw_result, profile=ctx.profile)),
+            violations=tuple(_violations_for(verdict, raw_result)),
             opa_verdict=verdict,
         )
 
 
-def _violations_for(
-    verdict: OpaVerdict | None,
-    raw_result: object,
-    *,
-    profile: Profile = Profile.FULL,
-) -> list[Violation]:
+def _violations_for(verdict: OpaVerdict | None, raw_result: object) -> list[Violation]:
     if verdict == OpaVerdict.ALLOW:
         return []
 
@@ -133,8 +134,6 @@ def _violations_for(
         ]
 
     if verdict == OpaVerdict.MANUAL_REVIEW:
-        if profile == Profile.POST_HITL:
-            return []
         return [
             Violation(
                 tier="governance",

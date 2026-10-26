@@ -460,6 +460,33 @@ class TestOpaGeneration:
         rego = generate_opa(cs)
         assert "rbac_allow_junior_trade" in rego
         assert "rbac_allow_senior_trade" in rego
+        # Denylisted values are compared normalised (GHSA-f6xq-23f7-9grm).
+        assert 'upper(trim_space(input.currency)) != "BTC"' in rego
+        assert 'upper(trim_space(input.currency)) != "XBT"' in rego
+        assert 'input.currency != "BTC"' not in rego
+
+    def test_rbac_denylist_entries_are_normalised(
+        self, minimal_cs: ControlStructureModel
+    ) -> None:
+        """A denylist entry written in another case or padded is still the
+        upper-cased literal the normalised input is compared with."""
+        from src.gateway.governance.stpa_compiler import (
+            RbacRoleModel,
+            RbacRulesModel,
+        )
+
+        role = RbacRoleModel(
+            name="junior",
+            allowed_actions=["execute_trade"],
+            denylist_field="currency",
+            limits={"allow_below": 5000, "manual_review_below": 10000},
+            restrictions=[{"denylist": [" btc", "Xbt"]}],
+        )
+        cs = minimal_cs.model_copy(update={"rbac_rules": RbacRulesModel(roles=[role])})
+        rego = generate_opa(cs)
+        for literal in ('"BTC"', '"XBT"'):
+            assert f"upper(trim_space(input.currency)) != {literal}" in rego
+        assert '" btc"' not in rego and '"Xbt"' not in rego
 
 
 # ---------------------------------------------------------------------------

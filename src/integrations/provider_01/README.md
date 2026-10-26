@@ -83,6 +83,25 @@ So an `ALLOW` lacking `authority_record_id` fails closed even though the
 response parsed cleanly — a **distinct** failure mode from a missing
 `decision`.
 
+### On the governor path (CAGE note)
+
+The kernel `fria` tier ([`FriaTier`](../../gateway/governance/jurisdiction/eu_ai_act/fria_tier.py))
+sends the workload identity the gateway verified for the request as `actor_id`
+and `operator_urn` (wire `actor_id`; empty when there is none, never a request
+value), the active trace id as `correlation_id` (wire `execution_id`, and
+`approval_id` when none is given), and the request's thread id
+(GHSA-f6xq-23f7-9grm). Before that fix the payload named no actor, so every
+`ALLOW` on this path failed at minting.
+
+An admission contributes no violation, so the tier reads only `admitted`: the
+minted ConsequenceToken is not carried to the routing seal (decision D2,
+POAM-2026-089). It is verified and consumed only by `ConsequenceGateway`, for
+callers that present one. Partner documents that describe the token on the
+`ALLOW` path describe that gateway path. `target` is not part of the kernel
+payload, so it goes out empty here; it is tracked with the other request facts
+the adapter defaults or fixes in POAM-2026-113
+([`docs/POAM.md`](../../../docs/POAM.md)).
+
 ## Wire contract change in the backward-compatibility remediation
 
 **Yes — this adapter's wire contract changed.** The legacy binary

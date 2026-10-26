@@ -91,10 +91,11 @@ async def _execute_scenario_entry_point(
         seal_issued: bool = False
 
         try:
-            # The corpus records unbound post-approval runs (no barrier snapshot);
-            # approval binding (D-H) is covered by tests/test_trade_governance_e2e.py.
+            # The corpus records unbound post-approval runs (no barrier snapshot)
+            # given against the scenario's own holds; approval binding (D-H) is
+            # covered by tests/test_trade_governance_e2e.py.
             kwargs = (
-                {"approval": granted_approval()}
+                {"approval": granted_approval(approved_holds=scenario.approved_holds)}
                 if entry_point == "revalidate_post_hitl"
                 else {}
             )

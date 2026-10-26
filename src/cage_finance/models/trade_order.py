@@ -128,6 +128,20 @@ class TradeOrder(BaseModel):
             raise ValueError("Invalid symbol format. Must be 1-5 letters.")
         return v
 
+    @field_validator("currency")
+    @classmethod
+    def validate_currency(cls, v):  # type: ignore[no-untyped-def]
+        # Normalize (trim, upper-case), then require an ISO 4217-shaped code:
+        # three ASCII letters. A look-alike spelling (an invisible character,
+        # a homoglyph) is refused here. Which currencies are tradable is the
+        # policy's decision (trade_governance.rego, tradable_currencies).
+        v = v.strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", v):
+            raise ValueError(
+                "Invalid currency format. Must be a 3-letter ISO 4217 code."
+            )
+        return v
+
     @field_validator("trader_role")
     @classmethod
     def validate_role(cls, v):  # type: ignore[no-untyped-def]

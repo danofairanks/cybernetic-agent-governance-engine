@@ -365,7 +365,7 @@ rbac_rules:
         manual_review_below: 10000
         deny_above: 10000
       restrictions:
-        - denylist: [BTC]
+        - denylist: [BTC, XBT]
 
     - name: senior
       allowed_actions: [execute_trade, market_analysis, write_db]
@@ -378,4 +378,4 @@ rbac_rules:
         manual_review_below: 1000000
         deny_above: 1000000
       restrictions:
-        - denylist: [BTC]
+        - denylist: [BTC, XBT]

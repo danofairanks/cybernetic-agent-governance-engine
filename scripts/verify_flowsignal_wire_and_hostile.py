@@ -770,6 +770,8 @@ async def main() -> None:
         assert v_stale[0].kind == ViolationKind.HARD
 
         # 5B. FriaTier with fresh local artefact + Live Wire ALLOW / REFUSE / ESCALATE
+        # The caller identity flows through the supported seam: FriaTier sends
+        # it as actor_id / operator_urn itself (GHSA-f6xq-23f7-9grm).
         fria_live = FriaTier(
             provider,
             region="EU_ECB",
@@ -777,19 +779,29 @@ async def main() -> None:
             reassessment_interval_days=365,
             gate_timeout_seconds=15.0,
             clock=lambda: now_utc,
+            caller_identity=lambda: allow_payload["operator_urn"],
         )
         fria_allow_params = {
             **allow_payload["params"],
             "thread_id": allow_payload["thread_id"],
         }
-        # Patch _payload on fria_live so the full envelope identifiers reach _build_cage_authority_request
+        kernel_payload = fria_live._payload
+        built = kernel_payload("payment.release", fria_allow_params)
+        assert (
+            built["actor_id"] == built["operator_urn"] == allow_payload["operator_urn"]
+        )
+        # Overlay only what the kernel payload does not carry (the adapter's
+        # approval_id and target) and pin the correlation and thread ids, so the
+        # wire request matches the recorded envelope; the actor is the kernel's.
         with patch.object(
             fria_live,
             "_payload",
             side_effect=lambda act, prms: {
-                **allow_payload,
-                "action": act,
-                "params": dict(prms),
+                **kernel_payload(act, prms),
+                "correlation_id": allow_payload["correlation_id"],
+                "thread_id": allow_payload["thread_id"],
+                "approval_id": allow_payload["approval_id"],
+                "target": allow_payload["target"],
             },
         ):
             v_live_allow = await fria_live.evaluate(

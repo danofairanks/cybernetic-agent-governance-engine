@@ -17,7 +17,7 @@ system-security-plan:
   metadata:
     title: CAGE System Security Plan (EU_ECB — EU AI Act / GDPR / DORA)
     published: '2026-06-15T00:00:00Z'
-    last-modified: '2026-10-06T00:00:00Z'
+    last-modified: '2026-10-25T00:00:00Z'
     version: 1.0.0-draft
     oscal-version: 1.0.4
     remarks: 'This System Security Plan (SSP) documents the compliance controls
@@ -219,7 +219,14 @@ system-security-plan:
         deployer FRIA artefact is missing or older than the 365-day
         reassessment interval, denies when the normative provider is
         unavailable, times out or refuses, and parks an approval when the
-        provider escalates to human review.'
+        provider escalates to human review. The tier declares
+        revalidated_after_approval, so it is re-run at post-approval
+        revalidation (POST_HITL) before an approved request is sealed: a
+        determination revoked, or an artefact expired, while a human reviews
+        the request denies, and an external hold is answered only by an
+        approval given against it (GHSA-f6xq-23f7-9grm). The provider payload
+        carries the verified workload identity of the caller (actor_id,
+        operator_urn) and the trace id (correlation_id).'
       purpose: 'Satisfies EU AI Act Art. 27 (Fundamental Rights Impact
         Assessment) and Art. 27(2) reassessment currency for deployers of
         High-Risk AI systems (control CTRL_FRIA_006).'
@@ -557,8 +564,14 @@ system-security-plan:
         uuid: eu-ecb-bycomp-0004-4000-8000-000000000004
         description: 'Fail-closed FRIA tier: stale or missing artefact, provider
           unavailability, timeout and refusal each deny; a needs_human_review
-          finding requires approval. Each path is observed failing in
-          tests/governor/test_jurisdiction_wiring.py.'
+          finding requires approval. Every path is re-checked at post-approval
+          revalidation: a refusal, an unavailable provider or a stale artefact
+          observed then denies with no seal and no phase-2 commit, and a hold
+          the approval was not given against is refused
+          (APPROVAL_CONTEXT_DRIFT). Each path is observed failing in
+          tests/governor/test_jurisdiction_wiring.py; proof/model.py claims
+          post_hitl_rechecks_jurisdiction and approval_answers_only_its_holds
+          hold, with runtime parity in tests/test_formal_profile_parity.py.'
         implementation-status:
           state: implemented
         links:

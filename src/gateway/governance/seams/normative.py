@@ -151,6 +151,15 @@ class NormativeProvider(Protocol):
         """POST /validate/fria — External Validation.
 
         Submit a governance decision payload for external FRIA validation.
+        The kernel ``fria`` tier sends:
+
+        * ``action``, ``params`` (the bound request params), ``region`` and
+          ``control_id``;
+        * ``actor_id`` and ``operator_urn``: the verified workload identity
+          of the caller (``""`` when there is none), never a request value;
+        * ``correlation_id``: the active trace id (``""`` outside a trace);
+        * ``thread_id``: the request's ``thread_id``, else its
+          ``transaction_id``, else ``correlation_id``.
         """
         ...  # pragma: no cover
 

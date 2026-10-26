@@ -25,8 +25,9 @@ spends second:
   concurrent redemptions at most one is sealed. A redemption that loses the
   race seals nothing and its phase-2 commits roll back.
 * **DENY** — the approval is spent, then the run is refused. An approved
-  request that no longer clears the barriers (or policy) must be approved
-  afresh.
+  request that no longer clears the barriers (or policy), or that now
+  reports a human-review hold the approval was not given against
+  (``approved_holds``), must be approved afresh.
 * **DEFER** (a warranted norm became ineligible, and nothing else refuses) —
   the approval is **not** spent. A warrant failure is not the approver's to
   repair, and the approval did not authorise anything that ran; once the
@@ -59,12 +60,21 @@ class PostHitlApproval:
             no longer covers the request. Must not raise; an error is
             ``False`` (fail closed).
         thread_id: The approval's thread, for trace correlation.
+        approved_holds: ``(tier, code)`` of every human-review (HITL) hold
+            the approval was given against (``DeferToken.hitl_holds``). The
+            committing run treats a re-run read-only stage's HITL finding as
+            answered only if it is one of these
+            (``pipeline.answered_by_approval``). A hold the reviewer was never
+            shown, e.g. an external authority escalating only after the
+            request was parked, stands and refuses the run. Empty (the
+            default) answers nothing: fail closed.
     """
 
     approval_id: str
     barrier_preview: str | None
     spend: Callable[[], Awaitable[bool]]
     thread_id: str | None = None
+    approved_holds: frozenset[tuple[str, str]] = frozenset()
 
 
 __all__ = ["PostHitlApproval"]

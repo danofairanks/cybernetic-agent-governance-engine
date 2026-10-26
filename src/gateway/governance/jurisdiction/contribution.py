@@ -40,13 +40,17 @@ class JurisdictionContribution:
     """The obligations one deployment region adds to every domain.
 
     ``tiers`` are merged after the domain tiers and sorted with them by
-    ``(phase, order, tier_name)``. They must be :class:`ReadOnlyTier` (phase 1): a
-    jurisdiction obligation is an assessment, never a barrier that reserves
-    state, so it can never change what POST_HITL re-runs (``proof/model.py``
-    asserts this for every entry of ``JURISDICTION_TIERS``).
+    ``(phase, order, tier_name)``. They must be :class:`ReadOnlyTier` (phase 1):
+    a jurisdiction obligation is an assessment, never a barrier that reserves
+    state. They must also declare ``revalidated_after_approval``: the
+    assessment is an external authority's, which can be revoked or expire
+    while a human reviews the request, so POST_HITL re-runs every
+    jurisdiction tier before an approved request is sealed
+    (``proof/model.py`` claim 10, ``post_hitl_rechecks_jurisdiction``).
 
     Raises:
         TypeError: A contributed tier is not a ``ReadOnlyTier``.
+        ValueError: A contributed tier is not ``revalidated_after_approval``.
     """
 
     region: str
@@ -63,4 +67,11 @@ class JurisdictionContribution:
                 raise TypeError(
                     f"jurisdiction {self.region!r}: tier {getattr(tier, 'tier_name', tier)!r} "
                     "is not a ReadOnlyTier; jurisdiction tiers must be read-only (phase 1)"
+                )
+            if tier.revalidated_after_approval is not True:
+                raise ValueError(
+                    f"jurisdiction {self.region!r}: tier {tier.tier_name!r} is not "
+                    "revalidated_after_approval; a jurisdiction assessment can change "
+                    "while a human reviews the request, so it must be re-run after "
+                    "approval"
                 )

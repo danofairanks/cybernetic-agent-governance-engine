@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import logging
 import re
 import sys
@@ -816,6 +817,17 @@ def _banner() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _rego_denylist_guard(field_name: str, item: object) -> str:
+    """A rule-body line refusing ``item`` in ``input.<field_name>``, normalised.
+
+    Both sides are trimmed and upper-cased, so ``"btc"`` or ``"BTC "`` cannot
+    pass a ``BTC`` restriction (GHSA-f6xq-23f7-9grm). A missing or non-string
+    field leaves the line undefined, so the rule does not fire (fail closed).
+    """
+    literal = json.dumps(str(item).strip().upper())
+    return f"    upper(trim_space(input.{field_name})) != {literal}"
+
+
 def generate_opa(cs: ControlStructureModel) -> str:
     """Generate an OPA Rego policy from the control structure."""
     lines: list[str] = [
@@ -974,7 +986,7 @@ def generate_opa(cs: ControlStructureModel) -> str:
                     lines.append(f'    lower(input.{subj_field}) == "{role.name}"')
                     lines.append(f"    input.{mag_field} <= {allow_below}")
                     for c in denylist:
-                        lines.append(f'    input.{deny_field} != "{c}"')
+                        lines.append(_rego_denylist_guard(deny_field, c))
                     lines.append("}")
                     lines.append("")
 
@@ -985,7 +997,7 @@ def generate_opa(cs: ControlStructureModel) -> str:
                     lines.append(f"    input.{mag_field} > {allow_below}")
                     lines.append(f"    input.{mag_field} <= {review_below}")
                     for c in denylist:
-                        lines.append(f'    input.{deny_field} != "{c}"')
+                        lines.append(_rego_denylist_guard(deny_field, c))
                     lines.append("}")
                     lines.append("")
 
@@ -2204,6 +2216,7 @@ def generate_agp(cs: ControlStructureModel) -> str:
                 for item in denylist:
                     lines.append(
                         f'Deny "{role_action}" where "{deny_field}" is "{item}" '
+                        "in any letter case or with surrounding spaces, "
                         f'for "{role.name}" role users.'
                     )
                     lines.append("")

@@ -367,6 +367,61 @@ def test_revalidate_post_hitl_requires_an_approval() -> None:
     assert "approved_barrier_preview" not in sig.parameters
 
 
+# ── OPA's manual review is answered only by an approval given against it ────
+
+_OPA_HOLD = ("governance", "OPA_MANUAL_REVIEW")
+
+
+def _manual_review_opa() -> MagicMock:
+    opa = MagicMock()
+    opa.evaluate_policy = AsyncMock(return_value="MANUAL_REVIEW")
+    return opa
+
+
+async def test_approved_opa_manual_review_seals() -> None:
+    """The reviewer was shown OPA's manual-review hold and approved it."""
+    governor, barrier = _governor(
+        StaticWarrantSource.eligible(), opa=_manual_review_opa()
+    )
+    counter = SpendCounter()
+    with patch(_MINT, return_value="seal-ok"):
+        seal = await governor.revalidate_post_hitl(
+            _ACTION,
+            dict(_TRADE),
+            approval=granted_approval(
+                "PASS", counter=counter, approved_holds=frozenset({_OPA_HOLD})
+            ),
+        )
+    assert seal == "seal-ok"
+    assert counter.results == [True]
+    assert barrier.commits == [_ACTION]
+
+
+async def test_opa_manual_review_the_reviewer_never_saw_is_approval_drift() -> None:
+    """OPA asks for a review only after the request was parked (a policy
+    change, a quota below reserve): the approval was given against other
+    holds, so the run is refused, nothing commits and the approval is spent."""
+    governor, barrier = _governor(
+        StaticWarrantSource.eligible(), opa=_manual_review_opa()
+    )
+    counter = SpendCounter()
+    other_hold = frozenset({("recording_barrier", "SOME_OTHER_HOLD")})
+    with patch(_MINT) as mint, patch(_REFUSAL) as refusal:
+        with pytest.raises(GovernanceError, match="APPROVAL_CONTEXT_DRIFT") as exc:
+            await governor.revalidate_post_hitl(
+                _ACTION,
+                dict(_TRADE),
+                approval=granted_approval(
+                    "PASS", counter=counter, approved_holds=other_hold
+                ),
+            )
+    assert "governance/OPA_MANUAL_REVIEW" in str(exc.value)
+    mint.assert_not_called()
+    assert counter.results == [True]
+    assert barrier.commits == []
+    refusal.assert_awaited_once()  # the refusal is evidenced
+
+
 # ── Queue: check without spending, spend exactly once ────────────────────────
 
 

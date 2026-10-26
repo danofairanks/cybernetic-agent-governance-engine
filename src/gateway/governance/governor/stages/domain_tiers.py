@@ -92,12 +92,17 @@ class DomainTierStage(Stage):
     Holds no per-request state: receipts go back to the pipeline, and a
     ``claims()`` exception propagates to the pipeline, which fails the stage
     closed for that request only.
+
+    ``revalidated_after_approval`` is the tier's own declaration
+    (``GovernanceTier.revalidated_after_approval``), fixed at construction:
+    ``POST_HITL`` re-runs a read-only tier only when it declares it.
     """
 
     def __init__(self, tier: GovernanceTier) -> None:
         self.mutating = check_tier_kind(tier)
         self.tier = tier
         self.name = tier.tier_name
+        self.revalidated_after_approval = bool(tier.revalidated_after_approval)
 
     def claims(self, ctx: StageContext) -> bool:
         """Delegate to the tier.  Exceptions propagate; ``run_pipeline`` fails closed."""

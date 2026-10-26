@@ -240,12 +240,17 @@ telemetry staleness limit is `TELEMETRY_MAX_STALENESS_SECONDS` (300 s).
    The governor spends the approval exactly once (`DeferQueue.consume_approval`, an atomic CAS)
    only when the run is about to mint a seal. A DENY spends it; a `WARRANT_INELIGIBLE` DEFER
    leaves it redeemable (POAM-2026-104), and the tool reports `DEFERRED:`.
-   Under `Profile.POST_HITL` (`stage_runs_under` in `pipeline.py`), the governor skips `ftra` and
-   `confidence` (which the human reviewer resolved), re-evaluates Phase 1 (`stpa`, `bounding`,
-   `opa`, `consensus`, `causal`, and under `EU_ECB` `fria`), and commits every claiming Phase 2
-   barrier (`cbf`, `fiscal`, or `dose_barrier`) inside `ReservationScope`. If
-   `approved_barrier_preview == PASS` at approval time but a live Phase 2 barrier now fails
-   (`FAIL`), `revalidate_post_hitl()` refuses with `DENY` (`reason="APPROVAL_CONTEXT_DRIFT"`).
+   Under `Profile.POST_HITL` (`stage_runs_under` in `pipeline.py`), the governor re-runs the
+   read-only stages whose verdict can change while a human decides: `opa`, the warrant gate
+   (when a region marks a norm `requires_warrant`), and every tier that declares
+   `revalidated_after_approval` (under `EU_ECB`, `fria`). A human-review hold any of them reports,
+   OPA's `MANUAL_REVIEW` included, is answered only if the approval was given against it
+   (`PostHitlApproval.approved_holds`, read from the parked token's holds); a hold the reviewer
+   never saw is refused with `DENY` (`reason="approval_context_drift"`, GHSA-f6xq-23f7-9grm).
+   It then commits every claiming Phase 2 barrier (`cbf`, `fiscal`, or `dose_barrier`) inside
+   `ReservationScope`. If `approved_barrier_preview == PASS` at approval time but a live Phase 2
+   barrier now fails (`FAIL`), `revalidate_post_hitl()` refuses with `DENY`
+   (`reason="APPROVAL_CONTEXT_DRIFT"`).
    The `GovernanceSeal` is minted, verified, and settled (`governor.settle(seal, executed=...)`)
    strictly inside `governance_middleware.py`; the advisor never receives a seal (POAM-2026-079).
 7. **Audit record persisted:** Override decision stored in Langfuse compliance project.

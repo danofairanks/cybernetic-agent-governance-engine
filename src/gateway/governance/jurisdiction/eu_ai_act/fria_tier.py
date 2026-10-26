@@ -30,6 +30,20 @@ claims, ``evaluate()``:
      ``FRIA_EXTERNAL_HOLD`` (the governor parks an approval token);
    * refused otherwise → HARD ``FRIA_REJECTED``.
 
+The provider's determination can change while a human reviews a held request
+(a mandate revoked, screening gone stale), and the artefact can expire, so the
+tier is ``revalidated_after_approval``: ``revalidate_post_hitl()`` (POST_HITL)
+consults the provider again before an approved request is sealed. A refusal,
+an unavailable provider or a stale artefact then denies. A
+``FRIA_EXTERNAL_HOLD`` is answered only if the approval was given against it
+(GHSA-f6xq-23f7-9grm).
+
+The provider payload (:meth:`FriaTier._payload`) names the request: the
+verified workload identity of the caller as ``actor_id`` / ``operator_urn``
+(empty when there is none), the active trace id as ``correlation_id``, and a
+``thread_id`` falling back from the request's ``thread_id`` to its
+``transaction_id`` to that trace id.
+
 Model confidence plays no part: a confident model is not an impact
 assessment, so the old confidence fast path that skipped the provider is
 deliberately absent. ``ConfidenceStage`` owns the confidence band in every
@@ -44,6 +58,8 @@ import math
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+from opentelemetry import trace
 
 from src.gateway.governance.constants import GovernanceControl
 from src.gateway.governance.contracts import ReadOnlyTier, Violation, ViolationKind
@@ -67,10 +83,22 @@ _CONTROL = GovernanceControl.FRIA_ASSESSMENT.value
 #: ``action -> artefact`` where an artefact carries an ISO-8601 ``assessed_at``.
 AssessmentLookup = Callable[[str], Mapping[str, Any] | None]
 ActionClaim = Callable[[str, Mapping[str, Any]], bool]
+#: The verified identity of the caller the request is evaluated for, or None.
+CallerIdentity = Callable[[], str | None]
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _no_caller() -> str | None:
+    return None
+
+
+def _trace_id() -> str:
+    """The active OTel trace id (32 hex characters), or ``""`` outside a trace."""
+    span_context = trace.get_current_span().get_span_context()
+    return f"{span_context.trace_id:032x}" if span_context.is_valid else ""
 
 
 class FriaTier(ReadOnlyTier):
@@ -87,6 +115,11 @@ class FriaTier(ReadOnlyTier):
             classifier). ``None`` claims every action — fail closed until the
             domain can say which of its actions are not high-risk.
         clock: Current time (UTC, timezone-aware); injectable for tests.
+        caller_identity: The verified workload identity of the caller, sent
+            as ``actor_id`` / ``operator_urn``. The EU contribution wires the
+            gateway's workload identity; the default knows no caller, so the
+            provider sees an empty actor (provider_01 then cannot mint a
+            ConsequenceToken and refuses an admission).
 
     Raises:
         ValueError: The interval or timeout is not a positive finite number.
@@ -95,6 +128,10 @@ class FriaTier(ReadOnlyTier):
     order = FRIA_TIER_ORDER
     tier_name = FRIA_TIER_NAME
     runtime_requirements: tuple[str, ...] = ()
+    #: The provider's determination can be revoked, and the artefact can
+    #: expire, while a human reviews a held request: POST_HITL re-runs the
+    #: tier before an approved request is sealed (GHSA-f6xq-23f7-9grm).
+    revalidated_after_approval = True
 
     def __init__(
         self,
@@ -106,6 +143,7 @@ class FriaTier(ReadOnlyTier):
         gate_timeout_seconds: float,
         claims: ActionClaim | None = None,
         clock: Callable[[], datetime] = _utcnow,
+        caller_identity: CallerIdentity = _no_caller,
     ) -> None:
         for name, value in (
             ("reassessment_interval_days", reassessment_interval_days),
@@ -126,6 +164,7 @@ class FriaTier(ReadOnlyTier):
         self._timeout = float(gate_timeout_seconds)
         self._claims = claims
         self._clock = clock
+        self._caller_identity = caller_identity
 
     @property
     def provider(self) -> NormativeProvider:
@@ -207,14 +246,36 @@ class FriaTier(ReadOnlyTier):
         return None
 
     def _payload(self, action: str, params: Mapping[str, Any]) -> dict[str, Any]:
-        thread_id = params.get("thread_id") or params.get("transaction_id") or ""
+        """What ``validate_fria()`` receives (``NormativeProvider.validate_fria``).
+
+        The caller and the correlation id sit at the top level, where
+        adapters read them; they are never taken from ``params``, which the
+        caller controls.
+        """
+        correlation_id = _trace_id()
+        thread_id = (
+            params.get("thread_id") or params.get("transaction_id") or correlation_id
+        )
+        caller = self._caller()
         return {
             "action": action,
             "params": dict(params),
             "thread_id": str(thread_id),
+            "correlation_id": correlation_id,
+            "actor_id": caller,
+            "operator_urn": caller,
             "region": self._region,
             "control_id": _CONTROL,
         }
+
+    def _caller(self) -> str:
+        """The verified caller identity, or ``""``; an unreadable one is none."""
+        try:
+            caller = self._caller_identity()
+        except Exception as exc:  # an identity that cannot be read is no identity
+            logger.warning("[fria] caller identity unavailable: %s", exc)
+            return ""
+        return caller if isinstance(caller, str) else ""
 
     def _unavailable(self, detail: str) -> Violation:
         logger.error("[fria] %s — failing closed", detail)

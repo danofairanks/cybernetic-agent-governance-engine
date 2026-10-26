@@ -32,19 +32,29 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from unittest.mock import patch
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
 
+from proof.model import REVALIDATED_TIERS
 from src.cage_finance.plugin import FinanceCagePlugin
 from src.gateway.governance import defer_queue as defer_queue_mod
 from src.gateway.governance.constants import ControlRegistry, GovernanceControl
-from src.gateway.governance.contracts import ViolationKind
+from src.gateway.governance.contracts import (
+    CommitReceipt,
+    MutatingTier,
+    ReadOnlyTier,
+    Violation,
+    ViolationKind,
+)
 from src.gateway.governance.env_posture import DeploymentPosture
 from src.gateway.governance.governor import posture as posture_mod
 from src.gateway.governance.governor.assembly import (
     DecisionFlags,
     GovernorComponents,
     assemble_governor,
+    kernel_stages,
 )
 from src.gateway.governance.governor.errors import GovernanceError
 from src.gateway.governance.governor.governor import SymbolicGovernor
@@ -69,6 +79,8 @@ from src.gateway.governance.jurisdiction.eu_ai_act.fria_tier import (
 )
 from src.gateway.governance.normative_provider import StubNormativeProvider
 from src.gateway.governance.seams.normative import ValidationResult
+from src.gateway.server.workload_identity import _serving
+from tests.fixtures.approval import SpendCounter, granted_approval
 from tests.fixtures.governor import (
     StaticWarrantSource,
     allow_opa,
@@ -586,6 +598,394 @@ async def test_admitted_fria_allows(defer_redis: Any) -> None:
         "execute_trade", {"amount": 10}
     )
     assert result["verdict"] == "ALLOW"
+
+
+# --- Post-approval revalidation (GHSA-f6xq-23f7-9grm) ---------------------------
+#
+# The authority behind the fria tier can change its determination while a
+# human reviews a held request. revalidate_post_hitl() must consult it again:
+# a refusal (or an outage, or an expired artefact) is never sealed, while the
+# escalation the reviewer approved does not block its own approval.
+
+_MINT = "src.gateway.governance.routing_seal.generate_seal_with_evidence"
+_FRIA_HOLD = ("fria", CODE_HOLD)
+_TRADE = {"amount": 10}
+
+
+def _escalate() -> ValidationResult:
+    return ValidationResult(
+        admitted=False,
+        findings=[{"needs_human_review": True, "message": "screening is stale"}],
+    )
+
+
+def _refuse() -> ValidationResult:
+    return ValidationResult(
+        admitted=False,
+        findings=[{"code": "FLOWSIGNAL_REFUSE", "message": "mandate revoked"}],
+    )
+
+
+async def _mint(*_args: Any, **_kwargs: Any) -> str:
+    return "seal-ok"
+
+
+async def _parked_approval(governor: SymbolicGovernor, counter: SpendCounter) -> Any:
+    """Park the escalated request and bind an approval to the parked token,
+    exactly as ``enforce_approved_governance`` does (``hitl_holds``)."""
+    result = await governor.validate_action("execute_trade", dict(_TRADE))
+    assert result["verdict"] == "REQUIRE_APPROVAL"
+    async with defer_queue_mod.open_defer_queue() as queue:
+        token = await queue.get(result["deferred_id"])
+    assert token is not None
+    return granted_approval(
+        token.barrier_preview, counter=counter, approved_holds=token.hitl_holds
+    )
+
+
+@pytest.mark.asyncio
+async def test_parked_token_records_the_fria_hold_the_reviewer_saw(
+    defer_redis: Any,
+) -> None:
+    approval = await _parked_approval(
+        _fria_only_governor(_FakeProvider(_escalate())), SpendCounter()
+    )
+    assert approval.approved_holds == frozenset({_FRIA_HOLD})
+
+
+@pytest.mark.asyncio
+async def test_refusal_during_review_is_caught_after_approval(defer_redis: Any) -> None:
+    """The advisory's scenario: ESCALATE, then the mandate is revoked while the
+    request waits, then a human approves. The approved run consults the
+    provider again and is refused; nothing is sealed."""
+    provider = _FakeProvider(_escalate())
+    governor = _fria_only_governor(provider)
+    counter = SpendCounter()
+    approval = await _parked_approval(governor, counter)
+
+    provider.result = _refuse()  # revoked while the request waited
+    with patch(_MINT) as mint:
+        with pytest.raises(GovernanceError, match=r"\[CTRL_FRIA_006\] FRIA refused"):
+            await governor.revalidate_post_hitl(
+                "execute_trade", dict(_TRADE), approval=approval
+            )
+    mint.assert_not_called()
+    assert len(provider.calls) == 2  # the preview and the approved run
+    assert counter.results == [True]  # a DENY spends the approval
+
+
+@pytest.mark.asyncio
+async def test_approved_escalation_still_escalating_is_sealed(defer_redis: Any) -> None:
+    """The hold the reviewer approved does not block its own approval."""
+    provider = _FakeProvider(_escalate())
+    governor = _fria_only_governor(provider)
+    counter = SpendCounter()
+    approval = await _parked_approval(governor, counter)
+
+    with patch(_MINT, side_effect=_mint) as mint:
+        seal = await governor.revalidate_post_hitl(
+            "execute_trade", dict(_TRADE), approval=approval
+        )
+    assert seal == "seal-ok"
+    mint.assert_called_once()
+    assert len(provider.calls) == 2
+    assert counter.results == [True]
+
+
+@pytest.mark.asyncio
+async def test_admission_at_revalidation_is_sealed(defer_redis: Any) -> None:
+    provider = _FakeProvider(_escalate())
+    governor = _fria_only_governor(provider)
+    approval = await _parked_approval(governor, SpendCounter())
+
+    provider.result = ValidationResult(admitted=True)
+    with patch(_MINT, side_effect=_mint):
+        assert (
+            await governor.revalidate_post_hitl(
+                "execute_trade", dict(_TRADE), approval=approval
+            )
+            == "seal-ok"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "approved_holds",
+    [frozenset(), frozenset({("governance", "OPA_MANUAL_REVIEW")})],
+    ids=["no_holds", "another_tiers_hold"],
+)
+async def test_hold_the_reviewer_never_saw_is_approval_drift(
+    defer_redis: Any, approved_holds: frozenset[tuple[str, str]]
+) -> None:
+    """An escalation that first appears after approval is not answered by it."""
+    provider = _FakeProvider(_escalate())
+    counter = SpendCounter()
+    with patch(_MINT) as mint:
+        with pytest.raises(GovernanceError, match="APPROVAL_CONTEXT_DRIFT") as exc:
+            await _fria_only_governor(provider).revalidate_post_hitl(
+                "execute_trade",
+                dict(_TRADE),
+                approval=granted_approval(
+                    counter=counter, approved_holds=approved_holds
+                ),
+            )
+    mint.assert_not_called()
+    assert "fria/FRIA_EXTERNAL_HOLD" in str(exc.value)
+    assert counter.results == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outage",
+    [{"exc": ConnectionError("provider down")}, {"hang": True}],
+    ids=["raises", "timeout"],
+)
+async def test_provider_outage_at_revalidation_denies(
+    defer_redis: Any, outage: dict[str, Any]
+) -> None:
+    provider = _FakeProvider(_escalate())
+    governor = _fria_only_governor(provider)
+    approval = await _parked_approval(governor, SpendCounter())
+
+    provider.exc = outage.get("exc")
+    provider.hang = outage.get("hang", False)
+    with patch(_MINT) as mint:
+        with pytest.raises(GovernanceError, match="CTRL_FRIA_006"):
+            await governor.revalidate_post_hitl(
+                "execute_trade", dict(_TRADE), approval=approval
+            )
+    mint.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_artefact_expiring_during_review_denies(defer_redis: Any) -> None:
+    provider = _FakeProvider(_escalate())
+    now = [_NOW]
+    tier = FriaTier(
+        provider,  # type: ignore[arg-type]
+        region="EU_ECB",
+        assessment_lookup=_lookup({"execute_trade": _FRESH}),
+        reassessment_interval_days=365,
+        gate_timeout_seconds=0.05,
+        clock=lambda: now[0],
+    )
+    governor = SymbolicGovernor(
+        GovernorComponents(
+            opa=allow_opa(),
+            core_stages=(),
+            classifier=default_classifier(),
+            posture=DeploymentPosture.TEST,
+            jurisdiction=JurisdictionContribution(region="EU_ECB", tiers=(tier,)),
+        )
+    )
+    approval = await _parked_approval(governor, SpendCounter())
+
+    now[0] = _NOW + timedelta(days=340)  # artefact now 370 days old
+    with patch(_MINT) as mint:
+        with pytest.raises(GovernanceError, match="CTRL_FRIA_006") as exc:
+            await governor.revalidate_post_hitl(
+                "execute_trade", dict(_TRADE), approval=approval
+            )
+    mint.assert_not_called()
+    assert "reassessment interval" in str(exc.value)
+    assert len(provider.calls) == 1  # an unassessed action never reaches the provider
+
+
+class _RecordingBarrier(MutatingTier):
+    """A claiming phase-2 tier that records commits and rollbacks."""
+
+    tier_name = "recording_barrier"
+    order = 9
+
+    def __init__(self) -> None:
+        self.commits: list[str] = []
+        self.rollbacks: list[str] = []
+
+    def claims_action(self, action: str, params: dict[str, Any]) -> bool:
+        return True
+
+    async def evaluate(self, action: str, params: dict[str, Any]) -> list[Violation]:
+        return []
+
+    async def commit(
+        self, action: str, params: dict[str, Any]
+    ) -> tuple[list[Violation], CommitReceipt | None]:
+        self.commits.append(action)
+        return [], CommitReceipt(tier=self.tier_name, magnitude=1.0)
+
+    async def rollback(
+        self, action: str, params: dict[str, Any], receipt: CommitReceipt
+    ) -> None:
+        self.rollbacks.append(action)
+
+    async def confirm(
+        self, action: str, params: dict[str, Any], receipt: CommitReceipt
+    ) -> None:
+        return None
+
+
+def _governor_with_kernel_and_barrier(
+    provider: _FakeProvider,
+) -> tuple[SymbolicGovernor, _RecordingBarrier]:
+    opa, stpa = allow_opa(), clean_stpa()
+    barrier = _RecordingBarrier()
+    governor = SymbolicGovernor(
+        GovernorComponents(
+            opa=opa,
+            core_stages=kernel_stages(opa, stpa),
+            classifier=default_classifier(),
+            domain_tiers=(barrier,),
+            posture=DeploymentPosture.TEST,
+            jurisdiction=JurisdictionContribution(
+                region="EU_ECB", tiers=(_tier(provider),)
+            ),
+        )
+    )
+    return governor, barrier
+
+
+@pytest.mark.asyncio
+async def test_revoked_authority_commits_no_barrier_headroom() -> None:
+    governor, barrier = _governor_with_kernel_and_barrier(_FakeProvider(_refuse()))
+    approval = granted_approval("PASS", approved_holds=frozenset({_FRIA_HOLD}))
+    with patch(_MINT) as mint:
+        with pytest.raises(GovernanceError, match="CTRL_FRIA_006"):
+            await governor.revalidate_post_hitl(
+                "execute_trade", dict(_TRADE), approval=approval
+            )
+    mint.assert_not_called()
+    assert barrier.commits == []
+
+
+@pytest.mark.asyncio
+async def test_approved_hold_commits_the_barrier_and_seals() -> None:
+    governor, barrier = _governor_with_kernel_and_barrier(_FakeProvider(_escalate()))
+    approval = granted_approval("PASS", approved_holds=frozenset({_FRIA_HOLD}))
+    with patch(_MINT, side_effect=_mint):
+        seal = await governor.revalidate_post_hitl(
+            "execute_trade", dict(_TRADE), approval=approval
+        )
+    assert seal == "seal-ok"
+    assert barrier.commits == ["execute_trade"]
+    assert barrier.rollbacks == []
+
+
+def test_fria_tier_is_revalidated_after_approval() -> None:
+    tier = _tier(_FakeProvider())
+    assert tier.revalidated_after_approval is True
+    assert DomainTierStage(tier).revalidated_after_approval is True
+
+
+def test_jurisdiction_tier_must_be_revalidated_after_approval() -> None:
+    class _NotRevalidated(ReadOnlyTier):
+        tier_name = "assessment"
+        order = 1
+
+        def claims_action(self, action: str, params: dict[str, Any]) -> bool:
+            return True
+
+        async def evaluate(
+            self, action: str, params: dict[str, Any]
+        ) -> list[Violation]:
+            return []
+
+    with pytest.raises(ValueError, match="revalidated_after_approval"):
+        JurisdictionContribution(region="EU_ECB", tiers=(_NotRevalidated(),))
+
+
+def test_only_jurisdiction_and_mutating_stages_are_revalidated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime declarations match the model: the finance plugin's read-only
+    tiers are not re-run after approval; fria and every barrier are."""
+    _use_region_thresholds(monkeypatch, "EU_ECB")
+    governor = _assemble(
+        jurisdiction=eu_ai_act.contribution(provider=_FakeProvider()),  # type: ignore[arg-type]
+        warranted=True,
+    )
+    declared = {
+        s.name: s.revalidated_after_approval
+        for s in governor.stages
+        if isinstance(s, DomainTierStage)
+    }
+    assert declared == {
+        s.name: s.mutating or s.name in REVALIDATED_TIERS
+        for s in governor.stages
+        if isinstance(s, DomainTierStage)
+    }
+    assert declared["fria"] is True
+
+
+# --- Provider payload identity (GHSA-f6xq-23f7-9grm, finding 3) -----------------
+
+_CALLER = "advisor.governance-stack.serviceaccount.identity.linkerd.cluster.local"
+
+
+@pytest.mark.asyncio
+async def test_payload_names_the_verified_caller_and_the_trace() -> None:
+    provider = _FakeProvider()
+    tier = _tier(provider, caller_identity=lambda: _CALLER)
+    tracer = TracerProvider().get_tracer(__name__)
+    with tracer.start_as_current_span("validate") as span:
+        assert await tier.evaluate("execute_trade", {"amount": 10}) == []
+        trace_id = f"{span.get_span_context().trace_id:032x}"
+    [payload] = provider.calls
+    assert payload["actor_id"] == payload["operator_urn"] == _CALLER
+    assert payload["correlation_id"] == trace_id
+    assert payload["thread_id"] == trace_id  # no thread or transaction id given
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    [
+        ({"thread_id": "t-1", "transaction_id": "tx-1"}, "t-1"),
+        ({"transaction_id": "tx-1"}, "tx-1"),
+    ],
+)
+async def test_payload_thread_prefers_the_request_ids(
+    params: dict[str, Any], expected: str
+) -> None:
+    provider = _FakeProvider()
+    await _tier(provider).evaluate("execute_trade", params)
+    assert provider.calls[0]["thread_id"] == expected
+
+
+@pytest.mark.asyncio
+async def test_caller_is_never_taken_from_request_params() -> None:
+    provider = _FakeProvider()
+    await _tier(provider).evaluate(
+        "execute_trade", {"actor_id": "attacker", "operator_urn": "attacker"}
+    )
+    payload = provider.calls[0]
+    assert payload["actor_id"] == payload["operator_urn"] == ""
+
+
+@pytest.mark.asyncio
+async def test_unreadable_caller_identity_is_no_caller() -> None:
+    def _boom() -> str:
+        raise RuntimeError("identity store unavailable")
+
+    provider = _FakeProvider()
+    await _tier(provider, caller_identity=_boom).evaluate("execute_trade", {})
+    assert provider.calls[0]["actor_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_eu_contribution_presents_the_workload_identity_it_verified() -> None:
+    provider = _FakeProvider()
+    fresh = {
+        "assessed_at": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    }
+    contribution = eu_ai_act.contribution(
+        provider=provider,  # type: ignore[arg-type]
+        assessment_lookup=_lookup({"execute_trade": fresh}),
+    )
+    [tier] = contribution.tiers
+    with _serving(_CALLER):
+        await tier.evaluate("execute_trade", {})
+    await tier.evaluate("execute_trade", {})  # outside a request: no caller
+    assert [c["actor_id"] for c in provider.calls] == [_CALLER, ""]
 
 
 # --- Posture: an enforcing EU posture refuses the stub --------------------------

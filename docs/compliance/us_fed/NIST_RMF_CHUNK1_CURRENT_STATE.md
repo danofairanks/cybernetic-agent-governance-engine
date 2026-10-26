@@ -319,7 +319,7 @@ The `tests/` directory contains **644 tests** across 28+ test files spanning uni
 - `scripts/run_agent_benchmark.py`: vLLM performance benchmark (latency, P95, throughput via OpenAI SDK).
 - `scripts/verify_colang_locally.py`: Colang syntax validation by loading NeMo rails.
 - `scripts/verify_remote.py`: Remote deployment verification script.
-- `tests/opa_snapshots/`: Two OPA decision snapshot files for regression testing (`01_no_identity_match.json`, `02_trade_no_auth.json`).
+- `tests/opa_snapshots/`: OPA decision snapshots that [`scripts/canary_opa_policy.sh`](../../../scripts/canary_opa_policy.sh) replays against a candidate policy (system authz by default). Trade-policy regression tests are the Rego unit tests in [`constraints_test.rego`](../../../compliance/postures/us_fed/opa/constraints_test.rego), run by the CI `rego-policy-lint` job.
 
 **Additional test files:** `test_agent_accuracy.py`, `test_agent_performance.py`, `test_cage_graph.py`, `test_config_manager.py`, `test_demo.py`, `test_deployment_verification.py`, `test_evaluator_mcp.py`, `test_gateway_client_perf.py`, `test_gateway_connectivity.py`, `test_governance_client.py`, `test_langfuse_evaluation.py`, `test_pipeline_compilation.py`, `test_profile_check.py`, `test_redis_config.py`, `test_trades_mcp.py`, `test_transpiler_llm.py`.
 
@@ -333,7 +333,8 @@ The `tests/` directory contains **644 tests** across 28+ test files spanning uni
 | `test_nemo_actions.py`          | [`tests/test_nemo_actions.py`](../../../tests/test_nemo_actions.py)                           | Colang action function tests          |
 | `test_red_teaming.py`           | [`tests/test_red_teaming.py`](../../../tests/test_red_teaming.py)                             | CBF drawdown resilience tests         |
 | Adversarial dataset             | [`tests/red_team/adversarial_dataset.json`](../../../tests/red_team/adversarial_dataset.json) | Structured adversarial test cases     |
-| OPA snapshots                   | `tests/opa_snapshots/`                                       | OPA decision regression fixtures      |
+| OPA snapshots                   | `tests/opa_snapshots/`                                       | Canary traffic snapshots (`canary_opa_policy.sh`) |
+| Rego unit tests                 | [`compliance/postures/us_fed/opa/constraints_test.rego`](../../../compliance/postures/us_fed/opa/constraints_test.rego) | Trade-policy regression tests (`opa test`) |
 | Load test                       | [`tests/load/locustfile.py`](../../../tests/load/locustfile.py)                               | Locust performance test               |
 | vLLM benchmark                  | [`scripts/run_agent_benchmark.py`](../../../scripts/run_agent_benchmark.py)                   | Latency/throughput/P95 measurement    |
 | Colang verifier                 | [`scripts/verify_colang_locally.py`](../../../scripts/verify_colang_locally.py)               | Colang 2.x syntax validation          |

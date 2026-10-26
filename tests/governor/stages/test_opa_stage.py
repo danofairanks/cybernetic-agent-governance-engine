@@ -177,8 +177,13 @@ async def test_opa_stage_sends_the_params_once_with_the_action():
 
 
 @pytest.mark.asyncio
-async def test_opa_stage_clears_manual_review_in_post_hitl():
-    """Under Profile.POST_HITL, MANUAL_REVIEW is satisfied by the human approval being redeemed."""
+async def test_opa_stage_reports_manual_review_in_post_hitl():
+    """Under Profile.POST_HITL, MANUAL_REVIEW is still a HITL finding.
+
+    The stage never answers its own hold: run_pipeline does, and only for an
+    approval given against it (``answered_by_approval``;
+    tests/test_formal_profile_parity.py).
+    """
     client = MockPolicyClient("MANUAL_REVIEW")
     stage = OpaStage(client)
 
@@ -188,7 +193,9 @@ async def test_opa_stage_clears_manual_review_in_post_hitl():
         action="execute_trade", params={"amount": 7500}, profile=Profile.POST_HITL
     )
     out = await stage.run(ctx)
-    assert list(out.violations) == []
+    assert [(v.code, v.kind) for v in out.violations] == [
+        ("OPA_MANUAL_REVIEW", ViolationKind.HITL)
+    ]
     assert out.opa_verdict == OpaVerdict.MANUAL_REVIEW
 
 

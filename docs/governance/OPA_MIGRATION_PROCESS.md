@@ -27,14 +27,15 @@ failure.
 
 | Risk | Description |
 |---|---|
-| **Policy drift** | A Rego rule is modified to relax an RBAC limit without updating the corresponding A.9.2 snapshot test vector, causing the CI gate to pass while the control is weakened. |
+| **Policy drift** | A Rego rule is modified to relax an RBAC limit without updating the corresponding Rego unit test, causing the CI gate to pass while the control is weakened. |
 | **Role allow-list erosion** | The `allowed_roles` set in `trade_governance.rego` is expanded without a corresponding A.9.2 sub-control review. |
 | **Fail-closed regression** | The `default allow = "DENY"` posture is accidentally removed or overridden by a new rule that matches too broadly. |
-| **Snapshot staleness** | OPA snapshot test vectors in `tests/opa_snapshots/` are not updated when policy logic changes, giving false confidence in CI. |
+| **Test staleness** | A new decision path ships without a Rego unit test in [`constraints_test.rego`](../../compliance/postures/us_fed/opa/constraints_test.rego), so `opa test` cannot catch its regression. |
 
-This runbook, combined with the `opa-a92-gate` CI job, creates a closed loop:
-every policy change must be accompanied by updated snapshot vectors, and the CI
-gate verifies both the policy logic and the snapshot coverage.
+This runbook, combined with the `rego-policy-lint` CI job
+([`security-scan.yml`](../../.github/workflows/security-scan.yml)), creates a
+closed loop: every policy change must be accompanied by Rego unit tests, and the
+job runs `opa check` and `opa test` over the policy and those tests.
 
 ---
 
@@ -48,10 +49,10 @@ expressed as invariants that the `opa test` suite must verify.
 |---|---|---|
 | **A.9.2.1** | User Registration and De-registration | `default allow = "DENY"` (fail-closed); unknown/missing `trader_role` must produce `"DENY"` |
 | **A.9.2.2** | User Access Provisioning | `allowed_roles` set is explicitly declared; any role not in `allowed_roles` must be denied for non-read-only actions |
-| **A.9.2.3** | Management of Privileged Access Rights | Senior-role limits are more permissive than junior-role limits but still bounded (≤ $500 k ALLOW, ≤ $1 M MANUAL_REVIEW, > $1 M DENY) |
+| **A.9.2.3** | Management of Privileged Access Rights | Senior-role limits are more permissive than junior-role limits but still bounded (≤ $500 k ALLOW, ≤ $1 M MANUAL_REVIEW, > $1 M DENY), for every trade action (`trade_actions`: `execute_trade`, `execute_trade_bounded`); a trade whose `currency` is not in `tradable_currencies`, or whose `currency` or `symbol` is in `restricted_assets` (any case or padding), is `"DENY"` |
 | **A.9.2.4** | Management of Secret Authentication Information | No credentials, tokens, or secrets may appear in Rego source; policy must not evaluate `input.password` or `input.token` directly |
 | **A.9.2.5** | Review of User Access Rights | `MANUAL_REVIEW` outcome must be reachable for boundary-condition amounts (junior $5 001–$10 000; senior $500 001–$1 000 000) |
-| **A.9.2.6** | Removal or Adjustment of Access Rights | Token quota exhaustion (`quota.quota_exhausted == true`) must produce `"DENY"` for `execute_trade`; below-minimum-reserve must produce `"MANUAL_REVIEW"` |
+| **A.9.2.6** | Removal or Adjustment of Access Rights | Token quota exhaustion (`quota.quota_exhausted == true`) must produce `"DENY"` for every trade action; below-minimum-reserve must produce `"MANUAL_REVIEW"` |
 
 ### Invariants That Must Never Be Removed
 
@@ -67,12 +68,24 @@ default allow = "DENY"
 # A.9.2.2 — explicit role allow-list
 allowed_roles := {"junior", "senior"}
 
-# A.9.2.6 — token quota hard deny
-allow = "DENY" if {
-    input.action == "execute_trade"
+# A.9.2.3 — every order-placing action is a trade action, held to the RBAC
+# limits, quota rules and asset restrictions; a trade's currency must be a
+# tradable currency (an allowlist), and restricted assets are refused on both
+# currency and symbol, all compared trimmed and upper-cased (GHSA-f6xq-23f7-9grm)
+trade_actions := {"execute_trade", "execute_trade_bounded"}
+tradable_currencies := {"USD"}
+restricted_assets := {"BTC", "XBT"}
+
+# A.9.2.6 — token quota hard deny, for every trade action
+_quota_exhausted if {
+    _is_trade
     quota := input.token_quota
     quota.quota_available == true
     quota.quota_exhausted == true
+}
+
+allow = "DENY" if {
+    _quota_exhausted
 }
 ```
 
@@ -92,22 +105,27 @@ requesting review.
   Preserve `default allow = "DENY"` and `allowed_roles` unless the change
   explicitly requires modifying them (which triggers CAB review).
 
-- [ ] **Add/update OPA snapshot test vectors in `tests/opa_snapshots/`** —
-  every new decision path introduced by the policy change must have at least one
-  corresponding snapshot JSON file. Follow the naming convention
-  `NN_<description>.json` (e.g. `04_senior_quota_exhausted.json`). Each file
-  must contain `input` and `expected_allow` fields matching the existing format.
+- [ ] **Add or update Rego unit tests in
+  [`constraints_test.rego`](../../compliance/postures/us_fed/opa/constraints_test.rego)**
+  — every new decision path introduced by the policy change must have at least
+  one `test_*` rule asserting its decision, and a fix must have a test that
+  fails on the policy before the fix. (`tests/opa_snapshots/` is the traffic
+  snapshot set that [`canary_opa_policy.sh`](../../scripts/canary_opa_policy.sh)
+  replays against the system-authz policy, not a trade-policy regression
+  suite.)
 
-- [ ] **Run `opa test ./src/governed_financial_advisor/governance/policy/ -v`
-  locally** — all tests must pass before pushing. Zero failures is the
-  acceptance criterion.
+- [ ] **Run the CI test bundle locally** — all tests must pass before pushing.
+  Zero failures is the acceptance criterion. The bundle must include the policy
+  directory, because the posture tests import `data.trade.governance`:
+  ```bash
+  opa check compliance/postures/us_fed/opa/ src/cage_finance/opa/ config/opa/ deployment/
+  opa test compliance/postures/us_fed/opa/ src/cage_finance/opa/ config/opa/ -v
+  ```
+  If the change affects EU_ECB or APAC_MAS postures, add their test directories.
 
-- [ ] **Run `opa test ./compliance/postures/us_fed/opa/ -v` locally** — all
-  US_FED posture tests must pass. If the change affects EU_ECB or APAC_MAS
-  postures, run those directories as well.
-
-- [ ] **Verify the CI `opa-a92-gate` job passes** — push to a feature branch
-  and confirm the `opa-a92-gate` job in `.github/workflows/ci.yml` completes
+- [ ] **Verify the CI `rego-policy-lint` job passes** — push to a feature branch
+  and confirm the job in
+  [`security-scan.yml`](../../.github/workflows/security-scan.yml) completes
   green. Do not merge until this job passes.
 
 - [ ] **Update `compliance/lula/lula-validation-a92.yaml` if the control
@@ -116,9 +134,11 @@ requesting review.
   manifest. Include the Lula update in the same PR or open a follow-on PR within
   2 business days of merge.
 
-- [ ] **Submit PR with `[A.9.2]` tag in the title** — example:
-  `[A.9.2] feat(opa): add BTC trading restriction for junior role`. This tag
-  enables automated filtering in the compliance audit trail.
+- [ ] **Tag the PR description with `[A.9.2]`** — this tag enables automated
+  filtering in the compliance audit trail. Keep it out of the title: PR titles
+  become squash-merge commit messages and must follow Conventional Commits
+  (AGENTS.md), e.g. title `fix(opa): restrict BTC for every trade action` with
+  `[A.9.2]` in the description.
 
 ---
 
@@ -147,32 +167,38 @@ it exercises, and the Rego rules in `trade_governance.rego` that implement them.
 
 ### Role → Permission Boundary Matrix
 
-Derived from `trade_governance.rego` RBAC rules:
+Derived from `trade_governance.rego` RBAC rules. "Trade" is any action in
+`trade_actions` (`execute_trade`, `execute_trade_bounded`); the risk-profile
+rules never admit one. Values are trimmed and upper-cased before comparison
+(`" usd "` is `USD`, `btc` is `BTC`). "Tradable" means the `currency` is in
+`tradable_currencies` (`USD`, an allowlist); "restricted" means the `currency`
+or `symbol` is in `restricted_assets` (`BTC`, `XBT`):
 
-| Role | Action | Amount | Currency | Decision |
+| Role | Action | Amount | Currency / symbol | Decision |
 |---|---|---|---|---|
-| `junior` | `execute_trade` | ≤ $5,000 | non-BTC | `ALLOW` |
-| `junior` | `execute_trade` | $5,001–$10,000 | non-BTC | `MANUAL_REVIEW` |
-| `junior` | `execute_trade` | > $10,000 | any | `DENY` |
-| `junior` | `execute_trade` | any | BTC | `DENY` |
-| `senior` | `execute_trade` | ≤ $500,000 | non-BTC | `ALLOW` |
-| `senior` | `execute_trade` | $500,001–$1,000,000 | non-BTC | `MANUAL_REVIEW` |
-| `senior` | `execute_trade` | > $1,000,000 | any | `DENY` |
-| `senior` | `execute_trade` | any | BTC | `DENY` |
-| *(unknown)* | `execute_trade` | any | any | `DENY` |
+| `junior` | trade | ≤ $5,000 | tradable currency, nothing restricted | `ALLOW` |
+| `junior` | trade | $5,001–$10,000 | tradable currency, nothing restricted | `MANUAL_REVIEW` |
+| `junior` | trade | > $10,000 | any | `DENY` |
+| `senior` | trade | ≤ $500,000 | tradable currency, nothing restricted | `ALLOW` |
+| `senior` | trade | $500,001–$1,000,000 | tradable currency, nothing restricted | `MANUAL_REVIEW` |
+| `senior` | trade | > $1,000,000 | any | `DENY` |
+| any | trade | any | restricted | `DENY` |
+| any | trade | any | currency missing, not a string or not tradable | `DENY` |
+| *(unknown)* | trade | any | any | `DENY` |
 | any valid role | `market_analysis` | N/A | N/A | `ALLOW` |
 
 ---
 
 ## 5. Rollback Procedure
 
-If a merged OPA policy change causes the `opa-a92-gate` CI job to fail in a
-downstream environment (staging or production), follow this procedure:
+If a merged OPA policy change is found to weaken a control (the CI
+`rego-policy-lint` job on `main`, or a check in a downstream environment, fails),
+follow this procedure:
 
 ### Step 1 — Identify the Failing Commit
 
 ```bash
-git log --oneline --grep="\[A.9.2\]" -10
+git log --oneline -10 -- src/cage_finance/opa/ compliance/postures/us_fed/opa/
 ```
 
 Note the commit SHA of the policy change that introduced the regression.
@@ -188,16 +214,9 @@ git revert <failing-commit-sha> --no-edit
 ### Step 3 — Verify Locally Before Pushing
 
 ```bash
-# Verify OPA tests pass after revert
-opa test ./src/governed_financial_advisor/governance/policy/ -v
-opa test ./compliance/postures/us_fed/opa/ -v
-
-# Verify snapshot vectors still match
-for f in tests/opa_snapshots/*.json; do
-  echo "Validating snapshot: $f"
-  opa eval -d src/cage_finance/opa/trade_governance.rego \
-    -i "$f" "data.trade.governance" --format pretty
-done
+# The CI invocation (rego-policy-lint)
+opa check compliance/postures/us_fed/opa/ src/cage_finance/opa/ config/opa/ deployment/
+opa test compliance/postures/us_fed/opa/ src/cage_finance/opa/ config/opa/ -v
 ```
 
 ### Step 4 — Push and Open Emergency PR
@@ -206,7 +225,8 @@ done
 git push origin fix/<ticket-id>-revert-a92-policy-regression
 ```
 
-Open a PR with title: `fix(opa): revert A.9.2 policy regression [A.9.2]`
+Open a PR titled `fix(opa): revert A.9.2 policy regression`, with `[A.9.2]` in
+its description.
 
 - Tag as **Cat-E (Emergency)** change per the adopting organization's own change-management process
 - Notify the AO within 1 hour of the revert push
@@ -215,69 +235,54 @@ Open a PR with title: `fix(opa): revert A.9.2 policy regression [A.9.2]`
 ### Step 5 — Post-Incident Review
 
 Within 5 business days of the revert merge:
-1. Conduct a root-cause analysis of why the snapshot test vectors did not catch
-   the regression before merge.
-2. Add a new snapshot test vector that would have caught the regression.
-3. Open a follow-on PR with the corrected policy change and the new snapshot.
+1. Conduct a root-cause analysis of why the Rego unit tests did not catch the
+   regression before merge.
+2. Add a Rego unit test that would have caught the regression.
+3. Open a follow-on PR with the corrected policy change and the new test.
 
 ---
 
 ## 6. CI Gate Reference
 
-The `opa-a92-gate` job is defined in `.github/workflows/ci.yml`
-and runs on every push and pull request to `main` (matching the same `on:`
-triggers as all other CI jobs).
+The `rego-policy-lint` job is defined in
+[`security-scan.yml`](../../.github/workflows/security-scan.yml) and runs on
+every pull request to `main`, every push to `main`, and nightly (`cron: 0 2 * * *`).
 
 ### Job Summary
 
 | Property | Value |
 |---|---|
-| **Job name** | `opa-a92-gate` |
+| **Job name** | `rego-policy-lint` ("OPA Rego Policy Lint and Test") |
 | **Runner** | `ubuntu-latest` |
-| **Depends on** | `lint` (or the appropriate upstream job — see `needs:` in the workflow file) |
-| **Fail behaviour** | `continue-on-error: false` (default) — any step failure fails the job and blocks merge |
+| **OPA version** | v0.61.0 (pinned download) |
+| **Fail behaviour** | `opa check` and `opa test` failures fail the job; the `opa fmt --diff` step is advisory (`\|\| true`) |
 
 ### Steps Executed
 
-1. **Checkout** — `actions/checkout@v4`
-
-2. **Install OPA** — downloads the latest static OPA binary from the official
-   release endpoint:
+1. **Checkout**
+2. **Install OPA** — the pinned v0.61.0 static binary.
+3. **Check Rego formatting** — `opa fmt --diff` over every `*.rego` (advisory).
+4. **OPA check all Rego files**
    ```bash
-   curl -L -o opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
-   chmod +x opa
-   sudo mv opa /usr/local/bin/opa
+   opa check compliance/postures/us_fed/opa/ src/cage_finance/opa/ config/opa/ deployment/
    ```
-
-3. **🔐 OPA A.9.2 Policy Gate — run `opa test` against trade governance policy**
+5. **Run OPA tests** — the policy directories are loaded with the tests, so the
+   posture tests can import `data.trade.governance`:
    ```bash
-   opa test ./src/governed_financial_advisor/governance/policy/ -v
+   opa test compliance/postures/us_fed/opa/ src/cage_finance/opa/ config/opa/ -v
    ```
-   Fails the job if any Rego unit test fails.
-
-4. **🔐 OPA A.9.2 Policy Gate — run `opa test` against US_FED posture**
-   ```bash
-   opa test ./compliance/postures/us_fed/opa/ -v
-   ```
-   Fails the job if any posture-level test fails.
-
-5. **🔐 OPA A.9.2 Policy Gate — validate snapshot test vectors**
-   Iterates over every JSON file in `tests/opa_snapshots/` and runs `opa eval`
-   against `trade_governance.rego`, printing the policy output for each vector.
-   This step ensures that snapshot inputs are syntactically valid and that the
-   policy evaluates without errors for all known test cases.
 
 ### Interpreting Failures
 
 | Failure symptom | Likely cause | Remediation |
 |---|---|---|
 | `opa test` exits non-zero | A Rego unit test assertion failed | Check the `-v` output for the failing test name; fix the policy or the test |
-| `opa eval` exits non-zero for a snapshot | The snapshot JSON is malformed or references a non-existent policy path | Validate the JSON and the `opa eval` path argument |
-| Job not triggered | Branch name does not match the `on: push: branches:` pattern | Ensure the branch follows the naming convention in `docs/operations/GIT_WORKFLOW_STANDARDS.md` |
+| `opa check` exits non-zero | A parse, type or safety error (e.g. an unsafe variable, an unknown built-in) in a loaded file | Fix the reported file and line |
+| Job not triggered | The change is not in a pull request to `main` | Open the pull request; feature-branch pushes alone do not trigger this workflow |
 
 ### Relationship to Lula Validation
 
-The `opa-a92-gate` job is a **pre-merge** gate that validates policy logic in
+The `rego-policy-lint` job is a **pre-merge** gate that validates policy logic in
 CI. It is complementary to — but does not replace — the Lula validation
 (`compliance/lula/lula-validation-a92.yaml`) which runs post-cluster-provisioning
 against a live Kubernetes environment. Both gates must pass for a policy change

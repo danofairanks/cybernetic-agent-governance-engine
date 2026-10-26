@@ -31,10 +31,10 @@ component-definition:
   uuid: c69e1b4c-8d52-5a8b-8e3b-9736eb9fbe23
   metadata:
     title: CAGE Validation — SC4
-    last-modified: '2026-07-01T13:18:54Z'
+    last-modified: '2026-10-25T23:30:57Z'
     version: 1.0.0
     oscal-version: 1.1.2
-    remarks: "Auto-converted from standalone lula validation format.\nRegion: US_FED. Posture: nist-sp800-53.\nNotes: System Constraint SC-4: Fiscal Limits and RBAC Enforcement. CRITICAL CONTROL — verified via Kubernetes ConfigMap label presence. The opa-compliance-status ConfigMap is created alongside the OPA Deployment during each deploy. Its absence or mislabelling indicates the enforcement layer was not correctly deployed. Any FAIL on this control triggers an immediate Slack/PagerDuty alert via compliance-bridge audit_workflow._step4_alert_on_critical_fail(). See: deployment/k8s/opa.yaml for label definitions. See: src/governed_financial_advisor/governance/policy/finance_policy.rego\n     for the Rego rules enforcing SC-4.\nSee: src/compliance_bridge/audit_workflow.py for the alert pipeline."
+    remarks: "Auto-converted from standalone lula validation format.\nRegion: US_FED. Posture: nist-sp800-53.\nNotes: System Constraint SC-4: Fiscal Limits and RBAC Enforcement. CRITICAL CONTROL — verified via Kubernetes ConfigMap label presence. The opa-compliance-status ConfigMap is created alongside the OPA Deployment during each deploy. Its absence or mislabelling indicates the enforcement layer was not correctly deployed. Any FAIL on this control triggers an immediate Slack/PagerDuty alert via compliance-bridge audit_workflow._step4_alert_on_critical_fail(). See: deployment/k8s/opa.yaml for label definitions. See: src/cage_finance/opa/trade_governance.rego\n     for the Rego rules enforcing SC-4.\nSee: src/compliance_bridge/audit_workflow.py for the alert pipeline."
   components:
   - uuid: 3c6ec14f-85af-5735-8a1b-dacc49e1abdc
     type: software

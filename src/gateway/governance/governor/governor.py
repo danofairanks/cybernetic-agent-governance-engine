@@ -569,6 +569,15 @@ class SymbolicGovernor:
         before anything runs. An approval given against ``FAIL`` (e.g. of a
         ``narrow_hint``'s clamped params) is honoured only if the barriers
         now admit the executed params.
+
+        The same holds for human-review holds. POST_HITL re-runs OPA, the
+        warrant gate and every read-only stage whose verdict can change while
+        a human decides (``revalidated_after_approval``). A HITL hold any of
+        them reports, OPA's ``MANUAL_REVIEW`` included, is answered only if
+        the approval was given against it (``approval.approved_holds``). A
+        hold the reviewer was never shown is refused
+        ``[APPROVAL_CONTEXT_DRIFT]``, and a HARD finding (an authority that
+        now refuses, or is unreachable) denies.
         """
         if rebind_inputs:
             params = await bind_server_inputs(
@@ -582,9 +591,15 @@ class SymbolicGovernor:
             span.set_attribute(
                 OBSERVATION_INPUT, json.dumps({"tool": action, "params": params})
             )
-            span.set_attribute("toctou.revalidation.scope", "opa+warrant+phase2")
+            span.set_attribute(
+                "toctou.revalidation.scope", "opa+warrant+revalidated+phase2"
+            )
             span.set_attribute("toctou.server_inputs_rebound", rebind_inputs)
             span.set_attribute("toctou.approval_id", approval.approval_id)
+            span.set_attribute(
+                "toctou.approved_holds",
+                sorted(f"{tier}/{code}" for tier, code in approval.approved_holds),
+            )
             if approval.thread_id is not None:
                 span.set_attribute("toctou.revalidation.trace_id", approval.thread_id)
             try:
@@ -616,7 +631,12 @@ class SymbolicGovernor:
                 raise GovernanceError(
                     f"no tier governs {action}; post-HITL re-validation refused"
                 )
-            ctx = StageContext(action=action, params=params, profile=Profile.POST_HITL)
+            ctx = StageContext(
+                action=action,
+                params=params,
+                profile=Profile.POST_HITL,
+                approved_holds=approval.approved_holds,
+            )
             # The approval is spent only by the run it authorises: admit()
             # runs after every stage passed and before the seal is minted.
             result, seal = await run_sealed(
@@ -697,6 +717,8 @@ class SymbolicGovernor:
                 and result.barrier_outcome == BarrierPreview.FAIL
             ):
                 await _deny_drift(action, params, result, approved)
+            if unapproved := _unapproved_holds(result):
+                await _deny_unapproved_holds(action, params, result, unapproved)
             await _deny(action, params, result)
 
     def _defers_on_reliance(self, result: PipelineResult) -> bool:
@@ -944,6 +966,55 @@ async def _deny_drift(
             "classification_reason": "approval_context_drift",
             "approved_barrier_preview": approved.value,
             "barrier_outcome": BarrierPreview.FAIL.value,
+        },
+        reliance=result.reliance,
+    )
+    raise GovernanceError(
+        f"handle_deny returned without raising; refusing {action}"
+    )  # fail closed
+
+
+def _unapproved_holds(result: PipelineResult) -> tuple[Violation, ...]:
+    """The human-review holds a POST_HITL run reports that its approval did not answer.
+
+    ``run_pipeline`` already answered every hold the approval was given
+    against (``answered_by_approval``), so any HITL finding left is one the
+    reviewer was never shown. Empty when a HARD finding is present: that
+    finding decided the refusal on its own.
+    """
+    if any(v.kind == ViolationKind.HARD for v in result.violations):
+        return ()
+    return tuple(v for v in result.violations if v.kind == ViolationKind.HITL)
+
+
+async def _deny_unapproved_holds(
+    action: str,
+    params: dict[str, Any],
+    result: PipelineResult,
+    holds: tuple[Violation, ...],
+) -> NoReturn:
+    """Refuse a committing run that reports a hold its approval was not given against.
+
+    The approval answered the holds the reviewer was shown; one that
+    appeared while the request waited needs a fresh approval. The drift
+    violation leads (it decided the refusal); the holds follow, so the
+    receipt names what now asks for a human.
+    """
+    named = ", ".join(f"{v.tier}/{v.code}" for v in holds)
+    drift = _approval_drift(
+        f"the approval was not given against hold(s) {named}, which the "
+        f"committing run now reports: {holds[0].message}; approve the request "
+        "afresh"
+    )
+    await handle_deny(
+        action,
+        params,
+        [drift, *result.violations],
+        list(result.tier_failures),
+        {
+            **_ftra_meta(result),
+            "classification_reason": "approval_context_drift",
+            "unapproved_holds": [f"{v.tier}/{v.code}" for v in holds],
         },
         reliance=result.reliance,
     )

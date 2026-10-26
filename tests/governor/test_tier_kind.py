@@ -168,7 +168,7 @@ def test_tier_of_neither_kind_is_refused() -> None:
     _refused(_Neither(), TypeError, "exactly one of ReadOnlyTier and MutatingTier")
 
 
-# ── Jurisdiction tiers must be read-only ────────────────────────────────────
+# ── Jurisdiction tiers must be read-only (and revalidated after approval) ──
 
 
 def test_jurisdiction_contribution_refuses_mutating_tier() -> None:
@@ -176,7 +176,13 @@ def test_jurisdiction_contribution_refuses_mutating_tier() -> None:
         JurisdictionContribution(region="EU_ECB", tiers=(_Mutating(),))
 
 
-def test_jurisdiction_contribution_accepts_read_only_tier() -> None:
-    contribution = JurisdictionContribution(region="EU_ECB", tiers=[_ReadOnly()])
+def test_jurisdiction_contribution_accepts_revalidated_read_only_tier() -> None:
+    """A read-only tier that declares revalidated_after_approval is accepted
+    (an undeclared one is refused: test_jurisdiction_wiring.py)."""
+
+    class _Revalidated(_ReadOnly):
+        revalidated_after_approval = True
+
+    contribution = JurisdictionContribution(region="EU_ECB", tiers=[_Revalidated()])
     assert isinstance(contribution.tiers, tuple)
     assert [check_tier_kind(t) for t in contribution.tiers] == [False]

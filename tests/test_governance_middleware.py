@@ -404,8 +404,9 @@ class TestEnforceApprovedGovernance:
     async def test_redeemable_approval_runs_post_hitl_and_returns_seal(self):
         governor = _mock_governor()
         governor.revalidate_post_hitl = AsyncMock(return_value="SEAL")
+        holds = frozenset({("fria", "FRIA_EXTERNAL_HOLD")})
         queue, open_queue = self._queue(
-            MagicMock(thread_id="thread-9", barrier_preview="PASS")
+            MagicMock(thread_id="thread-9", barrier_preview="PASS", hitl_holds=holds)
         )
         emit = AsyncMock()
 
@@ -419,6 +420,8 @@ class TestEnforceApprovedGovernance:
         assert approval.approval_id == "defer-1"
         assert approval.barrier_preview == "PASS"
         assert approval.thread_id == "thread-9"
+        # GHSA-f6xq-23f7-9grm: ... and to the human-review holds the reviewer saw.
+        assert approval.approved_holds == holds
         assert queue.redeemable_approval.await_args.kwargs["action"] == "execute_trade"
         # Checking spends nothing: only the governor's committing run spends.
         queue.consume_approval.assert_not_awaited()

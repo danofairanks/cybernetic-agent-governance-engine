@@ -69,9 +69,18 @@ permitted_boundaries:
     - etf
     - bonds
 
-  # Currency restrictions — compiled into OPA RBAC rules by stpa_compiler
+  # Currency restrictions — enforced by trade_governance.rego for every trade
+  # action (execute_trade, execute_trade_bounded). Values are compared
+  # normalised (whitespace trimmed, upper-cased); see GHSA-f6xq-23f7-9grm.
+  # A trade's currency must be one of tradable_currencies (an allowlist; the
+  # reference broker settles in USD only).
+  tradable_currencies:
+    - USD
+  # Prohibited as the currency or as the instrument symbol. Mirrored by
+  # rbac_rules.restrictions in src/cage_finance/config/stpa/trade_hazards.yaml.
   prohibited_currencies:
-    - BTC    # Compiled from rbac_rules.restrictions in stpa_control_structure.yaml
+    - BTC
+    - XBT    # alternate code for BTC
 
   # Prohibited actions — hard-blocked at gateway + OPA level
   prohibited_actions:

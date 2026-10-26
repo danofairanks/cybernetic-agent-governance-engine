@@ -42,8 +42,9 @@ def granted_approval(
     approval_id: str = "approval-test",
     thread_id: str | None = None,
     counter: SpendCounter | None = None,
+    approved_holds: frozenset[tuple[str, str]] = frozenset(),
 ) -> PostHitlApproval:
-    """An unspent approval given against ``barrier_preview``; spends once."""
+    """An unspent approval given against ``barrier_preview`` and ``approved_holds``; spends once."""
     state = counter if counter is not None else SpendCounter()
 
     async def _spend() -> bool:
@@ -58,6 +59,7 @@ def granted_approval(
         barrier_preview=barrier_preview,
         spend=_spend,
         thread_id=thread_id,
+        approved_holds=approved_holds,
     )
 
 

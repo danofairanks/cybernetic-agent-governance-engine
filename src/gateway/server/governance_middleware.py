@@ -181,7 +181,9 @@ async def enforce_approved_governance(
        spent yet.
     2. Run ``SymbolicGovernor.revalidate_post_hitl()`` (POST_HITL profile) on
        the fresh ``params``, handing it the approval bound to its
-       ``barrier_preview`` and to a ``spend`` that re-checks the token and
+       ``barrier_preview``, to the human-review holds the reviewer was shown
+       (``DeferToken.hitl_holds``; a hold outside them refuses the run) and
+       to a ``spend`` that re-checks the token and
        consumes it with the ``RESOLVED -> CONSUMED`` compare-and-swap
        (``DeferQueue.consume_approval``). The governor spends it only when
        it seals (a replayed or concurrent ``deferred_id`` loses the swap and
@@ -248,6 +250,7 @@ async def enforce_approved_governance(
                 barrier_preview=token.barrier_preview,
                 spend=_spend,
                 thread_id=token.thread_id,
+                approved_holds=token.hitl_holds,
             )
             return await governor.revalidate_post_hitl(
                 tool_name, params, approval=approval

@@ -297,6 +297,11 @@ class TestGenerateAGPRBAC:
         output = generate_agp(cs)
         assert 'Deny "execute_trade" where "currency" is "XAU"' in output
         assert 'Deny "execute_trade" where "currency" is "XBT"' in output
+        # The match is normalised, as in the generated Rego (GHSA-f6xq-23f7-9grm).
+        assert (
+            'is "XBT" in any letter case or with surrounding spaces, '
+            'for "junior" role users.'
+        ) in output
 
 
 # ---------------------------------------------------------------------------
