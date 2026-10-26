@@ -209,10 +209,12 @@ risk_score = 1.0 − confidence
 The causal gatekeeper blocks a trade when the estimated marginal effect of `trade_amount` on `risk_score` pushes the predicted risk above the safety boundary:
 
 ```
-(0.5 + estimate.value × amount) > 0.95  →  LOCK (trade blocked)
+(0.5 + β × amount / normalization_scale) > 0.95  →  LOCK (trade blocked)
 ```
 
-Additionally, the Placebo Treatment Refuter (50 simulations) must confirm the world-model is trustworthy: if the placebo still detects a significant effect (p < 0.05 **or** |effect| > 0.2), the model is deemed unreliable and the trade is blocked.
+β is fitted per normalised unit of trade amount ($10,000 for finance), so the scale cancels; on the finance synthetic telemetry the boundary trips at about $9,144. A lock is a HARD violation (DENY) that no approval can override.
+
+Additionally, the Placebo Treatment Refuter (50 simulations, treatment permuted row-wise) must confirm the world-model is trustworthy: if its result is missing, non-finite or has zero spread, or if the placebo still detects a significant effect (p < 0.05 **or** |effect| > 0.2 per normalised unit), the model is deemed unreliable and the trade is blocked.
 
 > **Source:** [`src/gateway/governance/causal/gatekeeper.py`](../../src/gateway/governance/causal/gatekeeper.py)
 

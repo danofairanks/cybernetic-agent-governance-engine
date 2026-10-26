@@ -136,10 +136,12 @@ A `risk_score` above the configured threshold triggers a `DEFER` (HITL escalatio
 The causal gatekeeper ([`src/gateway/governance/causal/gatekeeper.py`](../../../src/gateway/governance/causal/gatekeeper.py)) applies a marginal risk boundary:
 
 ```
-(0.5 + estimate.value × amount) > 0.95  →  DENY
+(0.5 + β × amount / normalization_scale) > 0.95  →  DENY
 ```
 
-The `PlaceboTreatmentRefuter` runs 50 simulations with significance threshold p < 0.05 and minimum effect size |eff| > 0.2 to validate causal estimates before they are used in the boundary check.
+β is fitted per normalised unit of trade amount ($10,000 for finance), so the scale cancels; on the finance synthetic telemetry the boundary trips at about $9,144.
+
+The `PlaceboTreatmentRefuter` runs 50 simulations on a row permutation of the treatment to validate causal estimates before they are used in the boundary check. The world model is refused when the refutation result is missing, non-finite or has zero spread, when p < 0.05, or when |eff| > 0.2 per normalised unit.
 
 ### Fiscal Limit Parameters (A.4 — Resource Management)
 

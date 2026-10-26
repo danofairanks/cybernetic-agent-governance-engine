@@ -26,14 +26,22 @@ Causal Graph (supplied via CausalSpec):
 
 Telemetry & Bounded Risk Formulation:
     - Sourced from Langfuse OTel settlement spans via TelemetryProvider.
+    - The treatment column is divided by ``CausalSpec.normalization_scale``
+      before DoWhy fits the model, so beta is the outcome change per
+      normalised unit of treatment.
     - If causal slope beta <= 0, the gate triggers a fail-closed lock.
     - If beta > 0, marginal risk is computed as
-      min(1.0, max(0.0, 0.5 + beta * treatment_value / normalization_scale)).
+      min(1.0, max(0.0, 0.5 + beta * treatment_value / normalization_scale)),
+      i.e. 0.5 plus the predicted change in the outcome metric. The scale
+      cancels, so it cannot move the treatment value at which the boundary
+      trips.
     - If risk exceeds CAUSAL_LOCK_RISK_BOUNDARY (0.95), the action is blocked.
 
-If a Placebo Refuter detects a spurious effect (p < 0.05 or large placebo
-effect), the gatekeeper "locks" the cage — the action is blocked because
-the underlying causal assumptions cannot be trusted.
+The placebo refuter permutes the treatment column. The gatekeeper "locks" the
+cage (the action is blocked because the underlying causal assumptions cannot
+be trusted) when the refutation result is missing or non-finite, when the
+simulated placebo effects have zero spread, or when it detects a spurious
+effect (p < 0.05 or a large placebo effect).
 
 Caching:
     Only the params-independent :class:`WorldModelVerdict` (trusted, beta,
@@ -42,6 +50,7 @@ Caching:
     evaluated on every call; it is never cached.
 """
 
+import copy
 import functools
 import hashlib
 import json
@@ -51,7 +60,8 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, TypeGuard
 
 import networkx as nx
 import numpy as np
@@ -120,21 +130,37 @@ CAUSAL_LOCK_P_VALUE_THRESHOLD: float = get_causal_p_value_threshold()
 # CAUSAL_LOCK_PLACEBO_EFFECT_MAGNITUDE (Phase 2 — placebo refutation):
 #   If the absolute value of the placebo refuter's new_effect exceeds this
 #   threshold, the estimated causal effect is considered unreliable regardless
-#   of the p-value.
+#   of the p-value. Like beta, the placebo effect is measured per normalised
+#   unit of treatment (``CausalSpec.normalization_scale``).
 CAUSAL_LOCK_PLACEBO_EFFECT_MAGNITUDE: float = get_causal_placebo_effect_magnitude()
 
 # CAUSAL_LOCK_RISK_BOUNDARY (Phase 1 — marginal risk boundary):
 #   If (0.5 + estimated_marginal_effect) exceeds this threshold, the proposed
 #   action is predicted to push the system's outcome metric above the safety
-#   boundary.
+#   boundary. estimated_marginal_effect = beta * treatment_value /
+#   normalization_scale, the predicted change in the outcome metric.
 CAUSAL_LOCK_RISK_BOUNDARY: float = get_causal_risk_boundary()
 
 # CAUSAL_NORMALIZATION_SCALE:
-#   Default normalization factor for converting raw treatment magnitudes to the
-#   [0, 1] scale when not overridden on CausalSpec.
-CAUSAL_NORMALIZATION_SCALE: float = float(
-    os.environ.get("CAUSAL_NORMALIZATION_SCALE", "10000.0")
-)
+#   Default treatment unit for a CausalSpec that does not set one. The
+#   treatment column is divided by the spec's scale before DoWhy fits the
+#   model, so beta and the placebo effect are expressed per this many units of
+#   treatment. The scale cancels out of the marginal risk boundary, so it
+#   cannot move the trip point. It is fixed per domain, not a tuning knob, and
+#   is deliberately not read from the environment: an override would silently
+#   change the units of CAUSAL_LOCK_PLACEBO_EFFECT_MAGNITUDE.
+CAUSAL_NORMALIZATION_SCALE: float = 10_000.0
+
+# Phase 2 placebo refutation. The placebo is a row permutation of the
+# treatment column. dowhy's default placebo for a float treatment ("Random
+# Data") is drawn from N(0, 0): a constant zero column, under which every
+# simulated effect is exactly 0.0 and the refutation cannot fail.
+PLACEBO_TYPE: str = "permute"
+PLACEBO_NUM_SIMULATIONS: int = 50
+# Numerical tolerance, not a policy threshold: simulated placebo effects whose
+# spread is at most this fraction of the effect scale (the larger of beta and
+# the largest |effect|) have zero spread up to floating-point noise.
+_PLACEBO_DEGENERATE_RTOL: float = 1e-9
 
 CAUSAL_GATEKEEPER_STRICT_MODE: bool = (
     os.environ.get("CAUSAL_GATEKEEPER_STRICT_MODE", "false").lower() == "true"
@@ -258,6 +284,9 @@ class WorldModelVerdict:
     boundary depends on the request's treatment value and is evaluated on
     every call from ``beta`` (see :meth:`CausalGatekeeper.causal_safety_check`).
 
+    ``beta`` is the outcome change per normalised unit of treatment, i.e. per
+    ``CausalSpec.normalization_scale`` units (see :func:`validate_world_model`).
+
     Invariant: ``trusted`` implies ``beta`` is a finite float ``> 0``.
     """
 
@@ -309,6 +338,12 @@ REASON_INCOMPLETE_SPEC = "incomplete_spec"
 REASON_RISK_BOUNDARY = "risk_boundary"
 REASON_CHECK_ERROR = "check_error"
 REASON_INSUFFICIENT_SAMPLES = "insufficient_samples"
+
+# Phase-2 (placebo refutation) reasons for an untrusted WorldModelVerdict.
+REASON_PLACEBO_RESULT_INVALID = "placebo_result_invalid"
+REASON_PLACEBO_DEGENERATE = "placebo_degenerate"
+REASON_PLACEBO_P_VALUE = "p_value_threshold"
+REASON_PLACEBO_EFFECT_MAGNITUDE = "placebo_effect_magnitude"
 
 
 @dataclass(frozen=True)
@@ -501,11 +536,13 @@ def _spec_from_config(causal_config: dict[str, Any]) -> CausalSpec | None:
 def _spec_fingerprint(spec: CausalSpec) -> str:
     """Return a short stable digest identifying the world-model a spec describes.
 
-    Covers the graph, treatment/outcome columns, and the synthetic telemetry
-    factory (the only telemetry source whose verdicts are cached), so two
-    domains or specs never share a cache entry. ``normalization_scale`` and the
-    extractors are deliberately excluded: they only affect the per-request risk
-    boundary, which is never cached.
+    Covers the graph, treatment/outcome columns, the treatment unit
+    (``normalization_scale``, which sets the unit of the cached ``beta``) and
+    the synthetic telemetry factory (the only telemetry source whose verdicts
+    are cached), so two domains or specs never share a cache entry, and a
+    verdict whose ``beta`` is in other units is never read back. The
+    extractors are deliberately excluded: they only affect the per-request
+    risk boundary, which is never cached.
     """
     factory = spec.synthetic_telemetry_factory
     factory_id = (
@@ -515,7 +552,13 @@ def _spec_fingerprint(spec: CausalSpec) -> str:
         f"{getattr(factory, '__qualname__', type(factory).__qualname__)}"
     )
     material = json.dumps(
-        [spec.graph_dot, spec.treatment_col, spec.outcome_col, factory_id]
+        [
+            spec.graph_dot,
+            spec.treatment_col,
+            spec.outcome_col,
+            repr(float(spec.normalization_scale)),
+            factory_id,
+        ]
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
@@ -824,6 +867,7 @@ class CausalGatekeeper:
             self.spec.treatment_col,
             self.spec.outcome_col,
             telemetry,
+            normalization_scale=self.spec.normalization_scale,
         )
 
     # ------------------------------------------------------------------
@@ -834,12 +878,9 @@ class CausalGatekeeper:
         """Return whether this request's predicted risk stays within the boundary."""
         if beta is None or not _is_positive_finite(beta):
             return False
-        norm_scale = (
-            self.spec.normalization_scale
-            if self.spec.normalization_scale > 0
-            else CAUSAL_NORMALIZATION_SCALE
+        estimated_risk = _marginal_risk(
+            beta, treatment_value, self.spec.normalization_scale
         )
-        estimated_risk = min(1.0, max(0.0, 0.5 + beta * treatment_value / norm_scale))
         with tracer.start_as_current_span(
             "causal_gatekeeper.risk_boundary"
         ) as risk_span:
@@ -858,18 +899,181 @@ class CausalGatekeeper:
         return True
 
 
+def _marginal_risk(
+    beta: float, treatment_value: float, normalization_scale: float
+) -> float:
+    """Predicted outcome metric for one request, clamped to ``[0, 1]``.
+
+    ``0.5 + beta * treatment_value / normalization_scale``. ``beta`` is the
+    outcome change per normalised unit of treatment (:func:`validate_world_model`
+    fits on ``treatment / normalization_scale``), so the second term is the
+    predicted change in the outcome metric and the scale cancels: the treatment
+    value at which the boundary trips does not depend on it.
+
+    Raises ``ValueError`` for a non-finite or non-positive scale (callers fail
+    closed).
+    """
+    if not _is_positive_finite(normalization_scale):
+        raise ValueError("normalization_scale must be a finite number > 0")
+    return min(1.0, max(0.0, 0.5 + beta * treatment_value / normalization_scale))
+
+
+@dataclass(frozen=True)
+class PlaceboRefutation:
+    """Result of the phase-2 placebo refutation, including every simulated effect.
+
+    ``p_value`` is dowhy's significance test of a null effect of 0 against the
+    simulated placebo effects; ``new_effect`` is their mean. dowhy's own
+    ``refute_estimate`` reports only those two numbers, which cannot reveal a
+    placebo distribution with zero spread (see :func:`_placebo_lock_reason`),
+    so the simulated ``effects`` are kept too.
+    """
+
+    p_value: float | None
+    new_effect: float | None
+    effects: tuple[float, ...]
+
+
+def _as_float(value: Any) -> float | None:
+    """Return a real scalar (or one-element array) as ``float``, else ``None``.
+
+    NaN and infinities are returned as floats: deciding about them is
+    :func:`_placebo_lock_reason`'s job.
+    """
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    try:
+        arr = np.asarray(value, dtype=float)
+    except (TypeError, ValueError):
+        return None
+    return float(arr.reshape(-1)[0]) if arr.size == 1 else None
+
+
+def _placebo_refutation(
+    data: pd.DataFrame, identified_estimand: Any, estimate: Any
+) -> PlaceboRefutation:
+    """Run dowhy's placebo-treatment refutation, keeping every simulated effect.
+
+    Uses the same per-simulation step and significance test as dowhy 0.14's
+    ``refute_placebo_treatment`` (a null effect of 0 tested against the
+    simulated placebo effects), with the placebo fixed to :data:`PLACEBO_TYPE`
+    and :data:`PLACEBO_NUM_SIMULATIONS` simulations. Exceptions propagate, so
+    callers fail closed.
+    """
+    from dowhy.causal_refuter import test_significance
+    from dowhy.causal_refuters.placebo_treatment_refuter import (
+        PlaceboType,
+        _refute_once,
+    )
+
+    placebo_type = PlaceboType(PLACEBO_TYPE)
+    placebo_estimand = copy.deepcopy(identified_estimand)
+    placebo_estimand.treatment_variable = ["placebo"]
+    treatment_names = list(identified_estimand.treatment_variable)
+    type_dict = dict(data.dtypes)
+    effects: list[float] = []
+    for _ in range(PLACEBO_NUM_SIMULATIONS):
+        effect = _as_float(
+            _refute_once(
+                data,
+                placebo_estimand,
+                estimate,
+                treatment_names,
+                type_dict,
+                placebo_type=placebo_type,
+            )
+        )
+        effects.append(math.nan if effect is None else effect)
+    # dowhy's significance tests read only ``.value`` of the estimate under
+    # test; the placebo null hypothesis is an effect of 0. A degenerate
+    # distribution divides by zero in the normal test; the guard handles that.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        significance = test_significance(
+            SimpleNamespace(value=0.0), np.asarray(effects, dtype=float)
+        )
+    return PlaceboRefutation(
+        p_value=_as_float(significance.get("p_value")),
+        new_effect=float(np.mean(effects)) if effects else None,
+        effects=tuple(effects),
+    )
+
+
+def _placebo_lock_reason(placebo: PlaceboRefutation, beta: float) -> str | None:
+    """Return why the placebo refutation refuses the world-model, or ``None``.
+
+    Checked in order; every failure is fail-closed:
+
+    1. Fewer than two simulated effects, or any non-finite one
+       -> :data:`REASON_PLACEBO_RESULT_INVALID`.
+    2. Zero spread across the simulated effects (up to floating-point noise)
+       -> :data:`REASON_PLACEBO_DEGENERATE`. A placebo distribution without
+       spread carries no evidence, and dowhy's significance test cannot show
+       it: with fewer than 100 simulations the normal test returns NaN or 0,
+       and from 100 on the bootstrap test returns a finite p-value of 1.0
+       when every effect is 0.0, which reads as a clean pass.
+    3. A missing or non-finite p-value or mean effect
+       -> :data:`REASON_PLACEBO_RESULT_INVALID`.
+    4. p-value below :data:`CAUSAL_LOCK_P_VALUE_THRESHOLD`
+       -> :data:`REASON_PLACEBO_P_VALUE`. dowhy tests a null effect of 0
+       against the placebo distribution, so a low p-value means the placebo
+       effects are not centred on 0: the refutation failed.
+    5. ``|mean placebo effect|`` above
+       :data:`CAUSAL_LOCK_PLACEBO_EFFECT_MAGNITUDE`
+       -> :data:`REASON_PLACEBO_EFFECT_MAGNITUDE`.
+    """
+
+    effects = placebo.effects
+    if len(effects) < 2 or not all(_is_finite_real(e) for e in effects):
+        return REASON_PLACEBO_RESULT_INVALID
+    effect_scale = max(abs(beta), max(abs(e) for e in effects))
+    if max(effects) - min(effects) <= _PLACEBO_DEGENERATE_RTOL * effect_scale:
+        return REASON_PLACEBO_DEGENERATE
+    p_value, new_effect = placebo.p_value, placebo.new_effect
+    if not _is_finite_real(p_value) or not _is_finite_real(new_effect):
+        return REASON_PLACEBO_RESULT_INVALID
+    if p_value < CAUSAL_LOCK_P_VALUE_THRESHOLD:
+        return REASON_PLACEBO_P_VALUE
+    if abs(new_effect) > CAUSAL_LOCK_PLACEBO_EFFECT_MAGNITUDE:
+        return REASON_PLACEBO_EFFECT_MAGNITUDE
+    return None
+
+
+def _is_finite_real(value: object) -> TypeGuard[float]:
+    """Return whether *value* is a finite real number (bools excluded)."""
+    return (
+        isinstance(value, (int, float, np.number))
+        and not isinstance(value, (bool, np.bool_))
+        and math.isfinite(value)
+    )
+
+
 def validate_world_model(
     graph_dot: str,
     treatment_col: str,
     outcome_col: str,
     telemetry: pd.DataFrame,
+    *,
+    normalization_scale: float,
 ) -> WorldModelVerdict:
     """Pure, process-pool-safe DoWhy estimation and placebo refutation.
 
-    Takes only primitive graph coordinates and a :class:`pandas.DataFrame` so
-    it can be executed in a :class:`concurrent.futures.ProcessPoolExecutor`
-    without pickling :class:`CausalSpec` callables.
+    Takes only primitive graph coordinates, the treatment unit and a
+    :class:`pandas.DataFrame` so it can be executed in a
+    :class:`concurrent.futures.ProcessPoolExecutor` without pickling
+    :class:`CausalSpec` callables.
+
+    The treatment column is divided by ``normalization_scale`` before DoWhy
+    fits the model, so ``beta`` and the placebo effects are per normalised
+    unit of treatment: the unit :func:`_marginal_risk` divides back out and
+    :data:`CAUSAL_LOCK_PLACEBO_EFFECT_MAGNITUDE` is expressed in. Callers pass
+    their spec's ``normalization_scale``.
+
+    Raises ``ValueError`` for a non-finite or non-positive
+    ``normalization_scale``.
     """
+    if not _is_positive_finite(normalization_scale):
+        raise ValueError("normalization_scale must be a finite number > 0")
+
     if not _DOWHY_AVAILABLE:
         logger.warning(
             "validate_world_model: 'dowhy' is not installed — failing closed."
@@ -908,6 +1112,7 @@ def validate_world_model(
         mrm_span.set_attribute("governance.scope", mrm_meta["scope"])
         mrm_span.set_attribute("governance.deployment_region", active_region)
         mrm_span.set_attribute("causal.graph", causal_graph.strip())
+        mrm_span.set_attribute("causal.normalization_scale", float(normalization_scale))
 
         min_samples = get_causal_min_samples()
         n_samples = len(telemetry)
@@ -923,8 +1128,12 @@ def validate_world_model(
             )
             return WorldModelVerdict(False, None, REASON_INSUFFICIENT_SAMPLES)
 
+        # beta is estimated per normalised unit of treatment.
+        frame = telemetry.copy()
+        frame[treatment] = frame[treatment] / normalization_scale
+
         model = _CausalModel(
-            data=telemetry,
+            data=frame,
             treatment=treatment,
             outcome=outcome,
             graph=causal_graph,
@@ -964,66 +1173,47 @@ def validate_world_model(
         tel_span.set_attribute("governance.legacy_citation", tel_legacy)
         tel_span.set_attribute("governance.scope", tel_meta["scope"])
         tel_span.set_attribute("governance.deployment_region", active_region)
-        tel_span.set_attribute("causal.num_simulations", 50)
+        tel_span.set_attribute("causal.num_simulations", PLACEBO_NUM_SIMULATIONS)
+        tel_span.set_attribute("causal.placebo_type", PLACEBO_TYPE)
 
         if not _check_telemetry_freshness(telemetry, tel_span):
             tel_span.set_attribute("causal.lock_reason", "stale_telemetry")
             return WorldModelVerdict(False, beta, "stale_telemetry")
 
-        refuter = model.refute_estimate(
-            identified_estimand,
-            estimate,
-            method_name="placebo_treatment_refuter",
-            num_simulations=50,
+        placebo = _placebo_refutation(frame, identified_estimand, estimate)
+        spread = (
+            float(np.ptp(np.asarray(placebo.effects, dtype=float)))
+            if placebo.effects
+            else math.nan
         )
+        if placebo.p_value is not None:
+            tel_span.set_attribute("causal.placebo_p_value", placebo.p_value)
+        if placebo.new_effect is not None:
+            tel_span.set_attribute("causal.placebo_new_effect", placebo.new_effect)
+        tel_span.set_attribute("causal.placebo_effect_spread", spread)
 
-        p_value = getattr(refuter, "refutation_result", {}).get("p_value", 1.0)
-        if isinstance(p_value, (list, tuple, np.ndarray)):
-            p_value = p_value[0]
-
-        new_effect = refuter.new_effect
-        if isinstance(new_effect, (list, tuple, np.ndarray)):
-            new_effect = new_effect[0]
-
-        tel_span.set_attribute(
-            "causal.placebo_p_value",
-            float(p_value) if p_value is not None else -1.0,
-        )
-        tel_span.set_attribute(
-            "causal.placebo_new_effect",
-            float(new_effect) if new_effect is not None else 0.0,
-        )
-
-        if (
-            p_value is not None
-            and not np.isnan(p_value)
-            and float(p_value) < CAUSAL_LOCK_P_VALUE_THRESHOLD
-        ):
+        lock_reason = _placebo_lock_reason(placebo, beta)
+        if lock_reason is not None:
             logger.warning(
-                "[%s] CAUSAL LOCK: Placebo p-value %.4f < %.2f — world-model untrustworthy.",
+                "[%s] CAUSAL LOCK: placebo refutation failed (%s; p_value=%s, "
+                "new_effect=%s, spread=%s) — world-model untrustworthy.",
                 GovernanceControl.TELEMETRY_LIVE_VALIDATION.value,
-                p_value,
-                CAUSAL_LOCK_P_VALUE_THRESHOLD,
+                lock_reason,
+                placebo.p_value,
+                placebo.new_effect,
+                spread,
             )
-            tel_span.set_attribute("causal.lock_reason", "p_value_threshold")
-            tel_span.set_attribute(
-                "causal.lock_p_value_threshold", CAUSAL_LOCK_P_VALUE_THRESHOLD
-            )
-            return WorldModelVerdict(False, beta, "p_value_threshold")
-
-        if abs(new_effect) > CAUSAL_LOCK_PLACEBO_EFFECT_MAGNITUDE:
-            logger.warning(
-                "[%s] CAUSAL LOCK: Placebo effect %.4f > %.2f — world-model untrustworthy.",
-                GovernanceControl.TELEMETRY_LIVE_VALIDATION.value,
-                new_effect,
-                CAUSAL_LOCK_PLACEBO_EFFECT_MAGNITUDE,
-            )
-            tel_span.set_attribute("causal.lock_reason", "placebo_effect_magnitude")
-            tel_span.set_attribute(
-                "causal.lock_effect_magnitude_threshold",
-                CAUSAL_LOCK_PLACEBO_EFFECT_MAGNITUDE,
-            )
-            return WorldModelVerdict(False, beta, "placebo_effect_magnitude")
+            tel_span.set_attribute("causal.lock_reason", lock_reason)
+            if lock_reason == REASON_PLACEBO_P_VALUE:
+                tel_span.set_attribute(
+                    "causal.lock_p_value_threshold", CAUSAL_LOCK_P_VALUE_THRESHOLD
+                )
+            elif lock_reason == REASON_PLACEBO_EFFECT_MAGNITUDE:
+                tel_span.set_attribute(
+                    "causal.lock_effect_magnitude_threshold",
+                    CAUSAL_LOCK_PLACEBO_EFFECT_MAGNITUDE,
+                )
+            return WorldModelVerdict(False, beta, lock_reason)
 
     return WorldModelVerdict(True, beta, REASON_TRUSTED)
 

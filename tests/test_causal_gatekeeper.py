@@ -869,67 +869,52 @@ class TestBoundedRiskScore:
     """Tests for the bounded risk score calculation (peer review fix).
 
     The estimated risk must be strictly bounded within [0.0, 1.0] regardless
-    of adversarial input amounts.
+    of adversarial input amounts. These call the gatekeeper's own risk
+    function; ``beta`` is per normalised unit of treatment (per $10,000 for
+    finance), the unit ``validate_world_model`` estimates it in.
     """
 
     def test_bounded_risk_with_extreme_positive_amount(self):
         """Risk score must be clamped at 1.0 for extreme positive amounts."""
         from src.gateway.governance.causal.gatekeeper import (
-            CAUSAL_LOCK_RISK_BOUNDARY,
             CAUSAL_NORMALIZATION_SCALE,
+            _marginal_risk,
         )
 
-        # Simulate the bounded calculation
-        estimate_value = 0.05  # Positive β (passes β≤0 guard)
-        extreme_amount = 1_000_000_000  # 1 billion — adversarial
+        estimated_risk = _marginal_risk(0.05, 1_000_000_000, CAUSAL_NORMALIZATION_SCALE)
 
-        estimated_risk = min(
-            1.0,
-            max(
-                0.0, 0.5 + estimate_value * extreme_amount / CAUSAL_NORMALIZATION_SCALE
-            ),
-        )
-
-        # Must be clamped at 1.0
         assert estimated_risk == 1.0, "Risk score must be clamped at 1.0"
-        assert estimated_risk <= 1.0, "Risk score must not exceed 1.0"
 
     def test_bounded_risk_with_negative_amount(self):
-        """Risk score must be clamped at 0.0 for negative amounts (if possible)."""
+        """Risk score must be clamped at 0.0 for negative amounts.
+
+        The request path rejects non-positive amounts before this point
+        (``invalid_treatment``); the function itself still clamps.
+        """
         from src.gateway.governance.causal.gatekeeper import (
             CAUSAL_NORMALIZATION_SCALE,
+            _marginal_risk,
         )
 
-        # Edge case: negative amount (unlikely in practice, but test boundary)
-        estimate_value = 0.05
-        negative_amount = -1_000_000
+        estimated_risk = _marginal_risk(0.05, -1_000_000, CAUSAL_NORMALIZATION_SCALE)
 
-        estimated_risk = min(
-            1.0,
-            max(
-                0.0, 0.5 + estimate_value * negative_amount / CAUSAL_NORMALIZATION_SCALE
-            ),
-        )
-
-        # Must be clamped at 0.0
         assert estimated_risk == 0.0, "Risk score must be clamped at 0.0"
-        assert estimated_risk >= 0.0, "Risk score must not go below 0.0"
 
     def test_normal_amount_produces_valid_risk(self):
-        """Normal trade amounts should produce risk in valid [0, 1] range."""
+        """0.5 + beta * amount / scale: beta 0.02 per $10,000 at $5,000 is 0.51."""
         from src.gateway.governance.causal.gatekeeper import (
             CAUSAL_NORMALIZATION_SCALE,
+            _marginal_risk,
         )
 
-        estimate_value = 0.02  # Typical positive β
-        normal_amount = 5000  # Normal trade amount
+        estimated_risk = _marginal_risk(0.02, 5000, CAUSAL_NORMALIZATION_SCALE)
 
-        estimated_risk = min(
-            1.0,
-            max(0.0, 0.5 + estimate_value * normal_amount / CAUSAL_NORMALIZATION_SCALE),
-        )
+        assert estimated_risk == pytest.approx(0.51)
 
-        # Should be a valid probability
-        assert 0.0 <= estimated_risk <= 1.0, "Risk score must be in [0, 1]"
-        # Should be around 0.5 + 0.02 * 5000 / 10000 = 0.51
-        assert 0.50 <= estimated_risk <= 0.52, f"Expected ~0.51, got {estimated_risk}"
+    @pytest.mark.parametrize("scale", [0.0, -1.0, float("nan"), float("inf")])
+    def test_invalid_normalization_scale_raises(self, scale):
+        """A non-finite or non-positive scale raises; the caller fails closed."""
+        from src.gateway.governance.causal.gatekeeper import _marginal_risk
+
+        with pytest.raises(ValueError):
+            _marginal_risk(0.05, 5000, scale)

@@ -133,15 +133,17 @@ A `risk_score` approaching 1.0 indicates high hallucination risk. Confabulation 
 The causal gatekeeper applies a marginal risk boundary to prevent trades whose causal effect estimate pushes the system into an unsafe region:
 
 ```
-(0.5 + estimate.value × amount) > CAUSAL_LOCK_RISK_BOUNDARY
+(0.5 + β × amount / normalization_scale) > CAUSAL_LOCK_RISK_BOUNDARY
 ```
+
+β is fitted per normalised unit of trade amount (`normalization_scale`, $10,000 for finance), so the scale cancels; on the finance synthetic telemetry the boundary trips at about $9,144.
 
 Named constants:
 - `CAUSAL_LOCK_RISK_BOUNDARY = 0.95`
 - `CAUSAL_LOCK_P_VALUE_THRESHOLD = 0.05`
-- `CAUSAL_LOCK_PLACEBO_EFFECT_MAGNITUDE = 0.2`
+- `CAUSAL_LOCK_PLACEBO_EFFECT_MAGNITUDE = 0.2` (risk score per normalised unit of treatment)
 
-The `PlaceboTreatmentRefuter` runs 50 simulations; a refutation is triggered when `p < 0.05` and `|effect| > 0.2`, indicating the causal estimate is not robust to placebo treatment.
+The `PlaceboTreatmentRefuter` runs 50 simulations on a row permutation of the treatment; the world model is refused when the result is missing, non-finite or has zero spread, or when `p < 0.05` or `|effect| > 0.2`, indicating the causal estimate is not robust to placebo treatment.
 
 ### 5.5. Routing Seal Integrity
 

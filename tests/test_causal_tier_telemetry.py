@@ -52,6 +52,7 @@ from src.gateway.governance.causal.gatekeeper import (
     REASON_RISK_BOUNDARY,
     REASON_TRUSTED,
     CausalDecision,
+    PlaceboRefutation,
     WorldModelVerdict,
     validate_world_model,
 )
@@ -100,8 +101,9 @@ class _Provider(BaseTelemetryProvider):
 
 
 class _StableDoWhy:
-    """Stand-in for ``dowhy.CausalModel`` with a small positive slope and a
-    placebo refuter that does not reject. Records that the refuter ran."""
+    """Stand-in for ``dowhy.CausalModel`` with a small positive slope, plus a
+    placebo step that does not reject (a spread of effects centred on 0).
+    Records that the placebo step ran."""
 
     refuted = 0
 
@@ -114,9 +116,12 @@ class _StableDoWhy:
     def estimate_effect(self, estimand: Any, method_name: str) -> Any:
         return SimpleNamespace(value=1e-5)
 
-    def refute_estimate(self, estimand: Any, estimate: Any, **_: Any) -> Any:
-        type(self).refuted += 1
-        return SimpleNamespace(refutation_result={"p_value": 0.9}, new_effect=0.0)
+    @classmethod
+    def placebo_refutation(cls, *_: Any, **__: Any) -> PlaceboRefutation:
+        cls.refuted += 1
+        return PlaceboRefutation(
+            p_value=0.9, new_effect=0.0, effects=(-0.01, 0.0, 0.01)
+        )
 
 
 @pytest.fixture
@@ -134,6 +139,7 @@ def stable_dowhy(monkeypatch):
     _StableDoWhy.refuted = 0
     monkeypatch.setattr(gk_mod, "_DOWHY_AVAILABLE", True)
     monkeypatch.setattr(gk_mod, "_CausalModel", _StableDoWhy)
+    monkeypatch.setattr(gk_mod, "_placebo_refutation", _StableDoWhy.placebo_refutation)
     return _StableDoWhy
 
 
@@ -304,6 +310,7 @@ def test_worker_validate_world_model_parity_with_gatekeeper():
         gk.spec.treatment_col,
         gk.spec.outcome_col,
         df,
+        normalization_scale=gk.spec.normalization_scale,
     )
     assert v_worker.trusted == v_direct.trusted
     assert v_worker.reason == v_direct.reason

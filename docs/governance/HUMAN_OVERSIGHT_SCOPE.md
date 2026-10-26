@@ -177,16 +177,22 @@ task.
 When the causal gatekeeper's marginal risk boundary condition is triggered:
 
 ```
-(0.5 + estimate.value × amount) > CAUSAL_LOCK_RISK_BOUNDARY  (0.95)
+(0.5 + β × amount / normalization_scale) > CAUSAL_LOCK_RISK_BOUNDARY  (0.95)
 ```
 
-the request is escalated to human review. This condition indicates that the
-causal effect of the proposed trade, combined with the trade amount, pushes
-the system into a high-risk region of the causal model's state space.
+the request is **denied, not escalated**. β is fitted per normalised unit of
+trade amount ($10,000 for finance), so the left-hand side is 0.5 plus the
+predicted change in risk score for this trade; on the finance synthetic
+telemetry the boundary trips at about $9,144. Every causal failure is a HARD
+violation (decision D3), and HARD outranks HITL in the classifier, so no human
+approval can override a causal lock, including for trades that other tiers
+would route to review.
 
-Additional causal lock conditions that trigger human escalation:
+The other causal lock conditions are refusals of the world model itself, with
+the same HARD outcome:
+- `PlaceboTreatmentRefuter` result missing, non-finite, or with zero spread across its simulations — the refutation carries no evidence
 - `PlaceboTreatmentRefuter` p-value < `CAUSAL_LOCK_P_VALUE_THRESHOLD` (0.05) — causal estimate is not robust
-- Placebo effect magnitude > `CAUSAL_LOCK_PLACEBO_EFFECT_MAGNITUDE` (0.2) — spurious causal signal detected
+- Placebo effect magnitude > `CAUSAL_LOCK_PLACEBO_EFFECT_MAGNITUDE` (0.2 per normalised unit) — spurious causal signal detected
 
 **Telemetry freshness:** In production, `causal_safety_check()` **fails closed**
 when no live telemetry is provided — there is no mock fallback for missing

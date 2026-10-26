@@ -32,6 +32,7 @@ Freshness invariants (fail-closed, zero new policy thresholds):
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import math
 import os
@@ -64,6 +65,7 @@ DEFAULT_REFRESH_INTERVAL_SECONDS: float = 20.0
 DEFAULT_TELEMETRY_WINDOW: int = 500
 REASON_STALE_TELEMETRY = "stale_telemetry"
 _DEFAULT_VALIDATE_FN = CausalGatekeeper._validate_world_model
+_DEFAULT_PLACEBO_REFUTATION = gk_mod._placebo_refutation
 
 
 def _resolve_refresh_interval(explicit: float | None) -> float:
@@ -291,15 +293,17 @@ class WorldModelRefresher:
         if not spec.graph_dot or not spec.treatment_col or not spec.outcome_col:
             return WorldModelVerdict(False, None, gk_mod.REASON_INCOMPLETE_SPEC)
 
-        # If a test or caller monkeypatched _validate_world_model or _CausalModel
-        # in-process, or disabled the process pool, run in a worker thread so
-        # in-process monkeypatches take effect without blocking the event loop.
+        # If a test or caller monkeypatched _validate_world_model, _CausalModel
+        # or the placebo step in-process, or disabled the process pool, run in
+        # a worker thread so in-process monkeypatches take effect without
+        # blocking the event loop.
         validate_attr = getattr(type(self._gatekeeper), "_validate_world_model", None)
         custom_validate = (
             "_validate_world_model" in self._gatekeeper.__dict__
             or validate_attr is not _DEFAULT_VALIDATE_FN
             or not isinstance(gk_mod._CausalModel, type)
             or gk_mod._CausalModel.__module__.startswith("tests")
+            or gk_mod._placebo_refutation is not _DEFAULT_PLACEBO_REFUTATION
         )
         if not self._use_process_pool or custom_validate:
             return await asyncio.to_thread(
@@ -311,7 +315,9 @@ class WorldModelRefresher:
             self._executor = ProcessPoolExecutor(max_workers=1)
         return await loop.run_in_executor(
             self._executor,
-            validate_world_model,
+            functools.partial(
+                validate_world_model, normalization_scale=spec.normalization_scale
+            ),
             spec.graph_dot,
             spec.treatment_col,
             spec.outcome_col,

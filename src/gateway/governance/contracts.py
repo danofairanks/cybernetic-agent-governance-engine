@@ -1011,7 +1011,14 @@ class PolicyClient(Protocol):
 
 @dataclass(frozen=True)
 class CausalSpec:
-    """Domain-contributed specification for causal world-model validation."""
+    """Domain-contributed specification for causal world-model validation.
+
+    ``normalization_scale`` is the treatment unit. The treatment column is
+    divided by it before the causal effect is estimated, so ``beta`` and the
+    placebo-effect threshold are per this many units of treatment (e.g.
+    $10,000 of trade amount for a finance domain). It cancels out of the
+    marginal risk boundary. It must be a finite number > 0.
+    """
 
     dag_gml: str = ""
     treatment: str = ""
@@ -1029,6 +1036,16 @@ class CausalSpec:
     synthetic_telemetry_factory: Callable[[], Any] | None = None
 
     def __post_init__(self) -> None:
+        scale = self.normalization_scale
+        if (
+            isinstance(scale, bool)
+            or not isinstance(scale, (int, float))
+            or not math.isfinite(scale)
+            or scale <= 0
+        ):
+            raise ValueError(
+                f"CausalSpec.normalization_scale must be a finite number > 0, got {scale!r}"
+            )
         resolved_graph = self.dag_gml or self.graph_dot
         resolved_treatment = self.treatment or self.treatment_col
         resolved_outcome = self.outcome or self.outcome_col

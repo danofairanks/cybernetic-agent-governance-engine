@@ -41,6 +41,7 @@ import pandas as pd
 from src.gateway.governance.causal import gatekeeper as gk_mod
 from src.gateway.governance.causal.gatekeeper import (
     CausalGatekeeper,
+    PlaceboRefutation,
     WorldModelVerdict,
 )
 from src.gateway.governance.contracts import CausalSpec
@@ -56,7 +57,12 @@ _LARGE = 10_000_000.0  # risk clamps to 1.0 -> exceeds the boundary
 
 
 class _FakeDoWhy:
-    """Counting stand-in for ``dowhy.CausalModel`` with tunable outputs."""
+    """Counting stand-in for ``dowhy.CausalModel`` and the placebo step.
+
+    The placebo step returns a :class:`PlaceboRefutation` with a non-degenerate
+    spread around ``new_effect``, so only ``p_value`` / ``new_effect`` decide
+    whether phase 2 locks.
+    """
 
     def __init__(self) -> None:
         self.beta: float = 0.5
@@ -79,14 +85,15 @@ class _FakeDoWhy:
                     raise ValueError("estimator blew up")
                 return SimpleNamespace(value=fake.beta)
 
-            def refute_estimate(self, *_a: Any, **_kw: Any) -> Any:
-                fake.refutations += 1
-                return SimpleNamespace(
-                    refutation_result={"p_value": fake.p_value},
-                    new_effect=fake.new_effect,
-                )
-
         return _Model()
+
+    def placebo_refutation(self, *_a: Any, **_kw: Any) -> PlaceboRefutation:
+        self.refutations += 1
+        return PlaceboRefutation(
+            p_value=self.p_value,
+            new_effect=self.new_effect,
+            effects=(self.new_effect - 0.01, self.new_effect, self.new_effect + 0.01),
+        )
 
 
 def _fresh_telemetry() -> pd.DataFrame:
@@ -133,6 +140,7 @@ def fake_dowhy(monkeypatch: pytest.MonkeyPatch) -> _FakeDoWhy:
     fake = _FakeDoWhy()
     monkeypatch.setattr(gk_mod, "_DOWHY_AVAILABLE", True)
     monkeypatch.setattr(gk_mod, "_CausalModel", fake)
+    monkeypatch.setattr(gk_mod, "_placebo_refutation", fake.placebo_refutation)
     monkeypatch.setattr(gk_mod, "ControlRegistry", _StubControlRegistry)
     monkeypatch.setenv("CAGE_ENV", "development")
     return fake
