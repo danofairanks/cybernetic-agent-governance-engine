@@ -3,7 +3,7 @@
 **System:** Cybernetic AI Governance Engine (CAGE)
 **Document:** Public Security Posture Statement
 **Frameworks:** NIST SP 800-53 Rev. 5, NIST AI 600-1, ISO 42001, EU AI Act, DORA, GDPR, MAS FEAT, MAS TRM, MAS Notice 655
-**Last Updated:** 2026-10-27
+**Last Updated:** 2026-10-28
 
 ---
 
@@ -91,6 +91,10 @@ The following findings are tracked as open items with target remediation dates. 
 | POAM-2026-118 | SI-10 / CA-7 / `CTRL_MRM_004` | An enforcing posture can be configured to run the causal tier on synthetic telemetry, and today an accident is all that stops it. [`get_telemetry_provider()`](../src/gateway/governance/telemetry_provider.py) refuses `CAGE_TELEMETRY_PROVIDER=mock` only when `CAGE_ENV` is `prod` or `production`. [`is_enforcing()`](../src/gateway/governance/env_posture.py) also treats `staging` and `local` as enforcing, and no other code path rejects `mock`. `MockTelemetryProvider` generates its outcome from the formula the model is calibrated on (POAM-2026-094). A staging or local deployment set to `mock` would therefore validate the world model against itself, against POAM-2026-088's rule that enforcing postures never substitute synthetic data. While POAM-2026-117 is open, that deployment would also enforce from POAM-2026-117's invented baseline. The shipped manifests set `remote`. What refuses the path today is that `MockTelemetryProvider` emits no timestamp column and the freshness check fails closed without one (`stale_telemetry`). Adding a timestamp column, the obvious fix for anyone trying to use the mock, would arm it. Remediation: select on `is_enforcing()` instead of the environment name | Moderate | 2026-11-15 |
 | POAM-2026-119 | CA-5 / CA-7 | 13 identifiers this document cites as commits name no object in the repository, so no assessor can check them against `main`. Six are pre-squash branch commits, each mapped to the squash commit on `main` that carries it. Seven resolve nowhere (not on `main` or GitHub, nor in the maintainer's clones, private refs or offsite bundle), including the only commit POAM-2026-011's closure cites. Gate G9 does not check commit citations. Recorded now; the repair follows the commit-citation check (detail section) | Moderate | 2026-11-15 |
 | POAM-2026-120 | SA-11 / CM-4 / CA-7 | Closed controls are not guarded by tests that fail when the control stops operating. POAM-2026-023's fix removed the serialization POAM-2026-070's control depended on, and for a month every test passed and the POA&M/Lula drift checker still counted POAM-2026-070 as covered, by Lula files whose names match its control IDs and which never mention the CBF. On 2026-10-27, 34 of the 80 closed entries cited no test, and the drift checker's 52 "covered" entries rest on the same file-name match, never checked against what the files assert. Remediation: a forward closure requirement plus a backfill of High entries only (detail section) | Moderate | 2026-12-31 |
+| POAM-2026-121 | CA-2 / CA-7 | §3 of the [Regional Posture Validation Report](compliance/REGIONAL_POSTURE_VALIDATION_REPORT.md), a published compliance validation report, makes a false claim. It says domain plugins and jurisdictional postures compose independently, "without colliding on common controls". That was false when written: `cage_finance`'s US_FED overlay redefines the kernel's `CTRL_FTRA_001`, and the registry logs the collision. The 12 pinned hashes are real but stale. They reproduce exactly, by the documented method, on the parent of the commit that published them (`3b69207c`), and that commit changed every kernel baseline. Remediation: decide whether independence is a property CAGE has, then correct or withdraw §3 (detail section) | High | 2026-11-15 |
+| POAM-2026-122 | SA-11 | Region pinning in the test suite is asymmetric. 57 tests are marked `eu_ecb` (48 of them in the required Pytest Logic Tests job), 23 `us_fed` (18) and 13 `apac_mas` (7), from 27, 4 and 4 marker uses, yet US_FED is the posture of the reference staging deployment and the one carrying the NIST SP 800-53 surface. The other ~9,000 tests run under the US_FED session default set in [`tests/conftest.py`](../tests/conftest.py), so US_FED is exercised broadly but pinned narrowly: an unmarked test that asserts US_FED behaviour depends on that default. Recorded, not swept | Low | 2026-12-31 |
+| POAM-2026-123 | CM-6 / SI-7 | A domain plugin's compliance overlay can redefine a kernel control, including one a jurisdictional tier enforces on. [`ControlRegistry`](../src/gateway/governance/constants.py) applies overlays over the kernel baseline with `dict.update` and only logs a WARNING on a collision. With the kernel baseline alone, the EU_ECB FRIA tier denies `execute_trade` (`FRIA_ASSESSMENT_STALE`) without consulting the provider. With a test overlay that defines `CTRL_FRIA_006` and a fresh artefact, the Art. 27(2) staleness gate passes and the provider decides (verified). `cage_finance` redefines `CTRL_FTRA_001` today, which nothing reads at runtime. Governor assembly fails closed on a slot collision; the registry does not (detail section) | High | 2026-11-30 |
+| POAM-2026-124 | SI-10 / AU-3 | Content-safety checks that did not run are reported as passed. With no NeMo rails, the gateway's `verify_content_safety` answers `"ERROR: NeMo rails not initialised."`, and the advisor returns that as `SUCCESS` with `cage.verdict = SAFE`. When NeMo raises "No main flow found", the tool answers `"SAFE"`. Both were verified hermetically. The control itself operates: the shipped Colang 2.x rails blocked four must-block inputs and passed a benign one. Today the first path needs a failed `nemoguardrails` import, and the second a rails config with no main flow. Under the planned `CAGE_INFERENCE_BACKEND=none`, which builds no rails, the first would fire on every call. The fix lands in that kernel change, before `none` exists (detail section) | High | 2026-11-30 |
 
 ### EU ECB Region (EU_ECB)
 
@@ -529,6 +533,107 @@ The SBOM/CVE Trivy scan ([`sbom.yml`](../.github/workflows/sbom.yml)) failed on 
 
 **Remaining Closure Criteria:**
 1. Merge `fix/ci-test-errors`. Record the merge commit SHA, and the date all three SBOM/CVE legs pass on `main`, here.
+
+### POAM-2026-124: Content-Safety Checks That Did Not Run Are Reported as Passed
+
+**Control:** NIST SI-10 (Information Input Validation), AU-3 (Content of Audit Records)
+**Risk Level:** High
+**Status:** Open — fix scheduled in the inference-backend kernel change, ahead of `CAGE_INFERENCE_BACKEND=none`
+**Date Opened:** 2026-10-28
+**Target Closure:** 2026-11-30
+
+**Description:**
+The gateway's [`verify_content_safety`](../src/gateway/server/mcp_tool_server.py) tool is the content-safety check the advisor forwards to the gateway (POAM-2026-079). Two paths report a check that did not run as passed. Both were verified hermetically on 2026-10-28.
+
+1. **Rails not initialised.** When `app.state.nemo_rails` is `None`, the tool returns the string `"ERROR: NeMo rails not initialised."` rather than a refusal. The advisor's [tool endpoint](../src/governed_financial_advisor/tools/api.py) returns it with `status: SUCCESS`. Because the output does not start with `BLOCKED`, the endpoint records `cage.verdict = SAFE` on its span.
+2. **NeMo has no main flow.** When NeMo raises "No main flow found", [`validate_with_nemo()`](../src/integrations/nemo/manager.py) logs a warning, marks its own span `DEGRADED_NO_MAIN_FLOW` and returns safe, on the reasoning that OPA and STPA still check the action. The tool then answers `"SAFE"`.
+   - The same pass-through is in `verify_input()` and `validate_output_semantics()`.
+   - The advisor graph's in-process NeMo input rail node calls `validate_with_nemo()`, so it records such input as `PASSED`. Its factory's docstring promises "unconditional fail-closed enforcement" (read, not tested).
+   - OPA and STPA check actions, not content, so no other tier covers a content-safety check that did not run.
+
+**Reachability.**
+- **The control operates with the shipped configuration (verified 2026-10-28).** The gateway's real rails were built from `config/rails` (Colang 2.x, with a `flow main`) and called through the tool. They blocked four must-block inputs and passed a benign one. Two were blocked at the deterministic prompt-injection stage. Two reached the LLM judge, which was unreachable and failed closed. "No main flow found" was not raised.
+- **Path 1 today.** In the shipped gateway image, `create_nemo_manager()` returns `None` only when `nemoguardrails` fails to import. A missing rails config stops startup instead. A config that fails to parse yields the transparent-fallback stub, which `validate_with_nemo()` rejects.
+- **Path 2 today** needs a rails config with no main flow.
+- **The probe showed neither path.** It ran no CAGE workload, and under #13 the gateway pod never starts.
+- **Path 1 under `none`.** The planned `CAGE_INFERENCE_BACKEND=none` builds no rails, so path 1 would fire on every call.
+
+**Remediation (in the inference-backend kernel change, before `none` exists):**
+1. Make every path in `verify_content_safety` that is not a verdict return `BLOCKED` with a reason code: rails absent, no main flow, any exception, and `none`.
+2. Make the advisor treat only an exact `SAFE` as safe and record every other output as not safe.
+3. Turn the "No main flow found" pass-through into a refusal with its own reason code in all three functions, keeping the degraded span marking.
+4. Add a test for each path, with a recorded mutation check showing the test fails when its path is reverted.
+
+### POAM-2026-123: Plugin Overlays Can Redefine Kernel Controls
+
+**Control:** NIST CM-6 (Configuration Settings), SI-7 (Software, Firmware, and Information Integrity)
+**Risk Level:** High
+**Status:** Open — recorded; remediation not started
+**Date Opened:** 2026-10-28
+**Target Closure:** 2026-11-30
+
+**Description:**
+[`ControlRegistry`](../src/gateway/governance/constants.py) loads the kernel's regional baseline, then applies each registered plugin overlay with `dict.update`. When an overlay key is already present, it logs "Control mapping collision … overrides earlier mapping" at WARNING and applies the overlay anyway. A plugin overlay can therefore replace any kernel control's definition. That includes a definition the normative provider supplied: `NormativeProviderDaemon` writes the fetched profile to the regional baseline file and reconfigures the registry, and the overlays are applied on top (read).
+
+- **Enforcement inputs (verified hermetically, 2026-10-28).**
+  - The EU_ECB FRIA tier's first gate is a staleness check (Art. 27(2) reassessment). It runs on the artefact `registry_assessment_lookup()` reads from `CTRL_FRIA_006.assessments`, which the normative provider is meant to supply. A missing or stale artefact is a hard `FRIA_ASSESSMENT_STALE` denial.
+  - With the kernel baseline alone, the real `FriaTier` denied `execute_trade` at that gate without consulting the provider.
+  - With a test overlay that defines `CTRL_FRIA_006` with a fresh `assessed_at`, the gate passed and the decision moved to the provider's `validate_fria()`. A stand-in that admits every request then admitted the action.
+  - The only signal was one WARNING. No shipped plugin defines `CTRL_FRIA_006`.
+  - The provider still decides after the gate, but the gate itself no longer holds.
+- **Live, without runtime effect.** `cage_finance`'s US_FED overlay replaces `CTRL_FTRA_001`. With it installed, the registry serves finance's citations, not the kernel's: "NIST AI RMF GOVERN-1.2" instead of "ISO 42001 A.8.4" (verified). No runtime path reads that mapping's content (read; POAM-2026-121).
+
+The kernel treats the equivalent conflict as fatal elsewhere: [`assemble_governor()`](../src/gateway/governance/governor/assembly.py) refuses two contributions that fill one engine slot (`GovernorAssemblyError`, "slot collision"). The registry does not. A domain plugin can therefore change what a kernel control attests to, and remove a jurisdictional tier's hard-deny gate, without anything failing.
+
+**Remediation:**
+1. Decide the composition contract, which also settles POAM-2026-121: may a plugin overlay touch a kernel control at all, and if so only by declared extension, never by silent replacement?
+2. Enforce the contract when the registry loads: an overlay key that redefines a kernel control fails closed, as an engine-slot collision does, unless it is declared.
+3. Test it in the required job: a collision fails, and a declared extension is applied and recorded.
+
+### POAM-2026-121: Validation Report Makes a False Composition Claim
+
+**Control:** NIST CA-2 (Control Assessments), CA-7 (Continuous Monitoring)
+**Risk Level:** High
+**Status:** Open — §3 and the report's head carry do-not-rely notes; correction or withdrawal not started
+**Date Opened:** 2026-10-28
+**Target Closure:** 2026-11-15
+
+**Description:**
+The [Regional Posture Validation Report](compliance/REGIONAL_POSTURE_VALIDATION_REPORT.md) is a published compliance validation report.
+- Its §3 is the evidence that domain plugins and jurisdictional postures compose independently.
+- It states an "Independence Guarantee": installing `cage_finance` and `cage_healthcare` "adds domain-specific controls without colliding on common controls".
+- It pins a control count and an RFC 8785 JCS SHA-256 hash for each of 12 cells: no plugin, `cage_finance`, `cage_healthcare` and both, in each of US_FED, EU_ECB and APAC_MAS.
+- It concludes that "Domain plugins and regional postures compose orthogonally".
+
+**The claim is false, and was false when written.**
+- `cage_finance`'s US_FED overlay redefines the kernel's `CTRL_FTRA_001`. At `main`, its internal ID, description, primary framework, legacy citation and co-frameworks all differ from the kernel's. A plugin overlay replacing a kernel control is the negation of independent composition.
+- The redefinition is present at every commit checked, from `3b69207c` (the tree the hashes were computed on) through both report commits to `main`.
+- The registry logs it as a "Control mapping collision" whenever it loads the cell. Rerunning the documented method at `3b69207c` logs it for both US_FED cells that include `cage_finance`, so the run that produced the hashes logged it too (inferred).
+
+**The hashes were computed by the documented method, one commit early.** The documented method registers each plugin's overlay directory with `register_overlay_dir()`, calls `ControlRegistry.reconfigure()` for the region and reads `active_hash`. Rerun with each commit's own registry code:
+- **`3b69207c`**, the parent of the commit that published the table: all 12 hashes and all 12 counts reproduce exactly.
+- **`2889b955`** (the publishing commit) and **`f2363d07`** (the report's last commit): no hash reproduces, though every count does.
+  - `2889b955` also added a `pii_retention_authority` key to each kernel baseline. The key is not a control, so it changed every cell's hash and no cell's count.
+- **`main`** (`2ef4f013`): neither the hashes nor 6 of the 12 counts reproduce. #378 moved `CTRL_MRM_004` out of `cage_finance`'s overlays into the kernel baselines, and since then `cage_finance` adds no control in any region.
+
+The table has therefore never described a tree that contains it. That part is a recoverable error, not a fabrication.
+
+**What the override changes at runtime.** The registry serves the overlay's definition (verified). But no runtime path reads that mapping's content (read): FTRA violations carry no control-ID prefix for `_control_payload()` to resolve, and deferrals record only the ID. FTRA's allow, deny and defer behaviour is therefore unaffected. The mechanism that permits the override is a kernel defect in its own right, recorded as POAM-2026-123.
+
+**Nothing would have caught this.**
+- No test pins a cell or fails on a collision.
+- The two workflows that exist to check the postures cannot fail the build. A workflow that cannot fail is telemetry, not a test.
+  - [`regional-posture.yml`](../.github/workflows/regional-posture.yml) is not a required check. It runs only after merge or on dispatch, its path filter leaves out the plugins' overlay directories, and it soft-gates EU_ECB and APAC_MAS.
+  - The test step of [`compliance-matrix.yml`](../.github/workflows/compliance-matrix.yml) is `continue-on-error`.
+
+**Remediation:**
+1. Decide whether independence is a property CAGE has or an aspiration it stated. That turns on POAM-2026-123: whether a plugin overlay may redefine a kernel control at all, and if so, how.
+2. Correct §3 to what is true, or withdraw it, together with the executive summary and conclusion that repeat it. If hashes are kept, regenerate them from a committed script at a stated commit, listing each cell's control set and any kernel control a plugin redefines.
+3. Only if independence is a property:
+   - guard it with a test in the required job that fails on a collision;
+   - make `regional-posture.yml` able to fail, or describe it as telemetry wherever it is cited as a check.
+
+Until then, §3 and the head of the report tell readers not to rely on the claim.
 
 ### POAM-2026-120: Closed Controls Without a Guarding Test
 
